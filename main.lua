@@ -374,7 +374,7 @@ function PluginManager:_doInstall(plugin_info, manifest)
         if ok then
             UIManager:show(InfoMessage:new{
                 text    = string.format(
-                    _("%s v%s installed.\nRestart KOReader to activate it."),
+                    _("%s v%s installed."),
                     plugin_info.fullname, plugin_info.version
                 ),
                 timeout = 6,
@@ -419,7 +419,7 @@ function PluginManager:_doUpdateAll(plugins_to_update, manifest)
         else
             UIManager:show(InfoMessage:new{
                 text    = string.format(
-                    _("%d plugins updated.\nRestart KOReader to activate changes."),
+                    _("%d plugins updated."),
                     total
                 ),
                 timeout = 6,
@@ -435,10 +435,7 @@ end
 function PluginManager:_doRemove(fullname, plugin_dir)
     rm_rf(_plugins_dir .. "/" .. plugin_dir)
     UIManager:show(InfoMessage:new{
-        text    = string.format(
-            _("%s removed.\nRestart KOReader to complete uninstallation."),
-            fullname
-        ),
+        text    = string.format(_("%s removed."), fullname),
         timeout = 5,
     })
 end
