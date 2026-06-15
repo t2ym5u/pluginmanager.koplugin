@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '_meta.lua'
+      - 'main.lua'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from _meta.lua
+        id: meta
+        run: |
+          version=$(grep -oP 'version\s*=\s*"\K[^"]+' _meta.lua)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "v${{ steps.meta.outputs.version }}" &>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build ZIP
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          PLUGIN="${GITHUB_REPOSITORY##*/}"
+          mkdir -p "/tmp/${PLUGIN}"
+          rsync -a --exclude='.git' --exclude='.github' . "/tmp/${PLUGIN}/"
+          cd /tmp && zip -r "${PLUGIN}.zip" "${PLUGIN}/"
+          echo "ZIP=/tmp/${PLUGIN}.zip" >> "$GITHUB_ENV"
+          echo "PLUGIN=${PLUGIN}" >> "$GITHUB_ENV"
+
+      - name: Create release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.meta.outputs.version }}" \
+            --title "v${{ steps.meta.outputs.version }}" \
+            --notes "Extract \`${PLUGIN}.zip\` into your KOReader \`plugins/\` folder." \
+            "$ZIP"
