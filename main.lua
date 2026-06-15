@@ -5,6 +5,7 @@ local ButtonDialog    = require("ui/widget/buttondialog")
 local ConfirmBox      = require("ui/widget/confirmbox")
 local DataStorage     = require("datastorage")
 local InfoMessage     = require("ui/widget/infomessage")
+local InputDialog     = require("ui/widget/inputdialog")
 local LuaSettings     = require("luasettings")
 local UIManager       = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -12,6 +13,12 @@ local _               = require("gettext")
 
 local MANIFEST_URL   = "https://raw.githubusercontent.com/t2ym5u/koreader-plugins/master/manifest.json"
 local AUTO_CHECK_TTL = 86400  -- re-check automatically at most once every 24 h
+
+local function source_from_url(url)
+    local user = url:match("raw%.githubusercontent%.com/([^/]+)/")
+    if user then return user end
+    return url:match("https?://([^/]+)/") or url
+end
 
 -- ---------------------------------------------------------------------------
 -- PluginManager
@@ -34,8 +41,10 @@ function PluginManager:ensureSettings()
     end
 end
 
-function PluginManager:saveManifestCache(json_str)
+function PluginManager:saveManifestCache(manifest)
     self:ensureSettings()
+    local ok, json = pcall(require, "rapidjson")
+    local json_str = ok and json.encode(manifest) or "{}"
     self.settings:saveSetting("manifest_json", json_str)
     self.settings:saveSetting("last_check",    os.time())
     self.settings:flush()
@@ -215,24 +224,31 @@ function PluginManager:fetchManifest()
     UIManager:show(notice)
     UIManager:scheduleIn(0.2, function()
         UIManager:close(notice)
-        local body, err = fetch_url(MANIFEST_URL)
-        if not body then
+        local urls = self:getRepoURLs()
+        local results, errors = {}, {}
+        for _, url in ipairs(urls) do
+            local body, err = fetch_url(url)
+            if body then
+                local manifest = parse_json(body)
+                if manifest and manifest.plugins then
+                    results[#results + 1] = { url = url, manifest = manifest }
+                else
+                    errors[#errors + 1] = source_from_url(url) .. ": " .. _("invalid manifest")
+                end
+            else
+                errors[#errors + 1] = source_from_url(url) .. ": " .. (err or "?")
+            end
+        end
+        if #results == 0 then
             UIManager:show(InfoMessage:new{
-                text    = _("Network error:") .. "\n" .. (err or "?"),
+                text    = _("Network error:") .. "\n" .. table.concat(errors, "\n"),
                 timeout = 5,
             })
             return
         end
-        local manifest, jerr = parse_json(body)
-        if not manifest or not manifest.plugins then
-            UIManager:show(InfoMessage:new{
-                text    = _("Manifest error:") .. "\n" .. (jerr or _("unexpected format")),
-                timeout = 5,
-            })
-            return
-        end
+        local manifest = self:mergeManifests(results)
         self._manifest = manifest
-        self:saveManifestCache(body)
+        self:saveManifestCache(manifest)
 
         local installed = self:scanInstalled()
         local n_update, n_new = 0, 0
@@ -245,6 +261,9 @@ function PluginManager:fetchManifest()
             end
         end
         local parts = {}
+        if #errors > 0 then
+            parts[#parts + 1] = string.format(_("%d source(s) unavailable"), #errors)
+        end
         if n_update > 0 then parts[#parts+1] = string.format(_("%d update(s) available"), n_update) end
         if n_new    > 0 then parts[#parts+1] = string.format(_("%d new plugin(s)"), n_new) end
         if #parts   == 0 then parts[#parts+1] = _("All installed plugins are up to date.") end
@@ -261,13 +280,21 @@ function PluginManager:_silentCheck()
     local ok, NetworkMgr = pcall(require, "ui/network/manager")
     if ok and NetworkMgr and not NetworkMgr:isConnected() then return end
 
-    local body = fetch_url(MANIFEST_URL)
-    if not body then return end
-    local manifest = parse_json(body)
-    if not manifest or not manifest.plugins then return end
-
+    local urls = self:getRepoURLs()
+    local results = {}
+    for _, url in ipairs(urls) do
+        local body = fetch_url(url)
+        if body then
+            local manifest = parse_json(body)
+            if manifest and manifest.plugins then
+                results[#results + 1] = { url = url, manifest = manifest }
+            end
+        end
+    end
+    if #results == 0 then return end
+    local manifest = self:mergeManifests(results)
     self._manifest = manifest
-    self:saveManifestCache(body)
+    self:saveManifestCache(manifest)
 
     local installed = self:scanInstalled()
     local n_update  = 0
@@ -283,6 +310,113 @@ function PluginManager:_silentCheck()
             timeout = 5,
         })
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- Multi-source helpers
+-- ---------------------------------------------------------------------------
+
+function PluginManager:getRepoURLs()
+    self:ensureSettings()
+    local urls = { MANIFEST_URL }
+    local extra = self.settings:readSetting("extra_repos") or {}
+    for _, u in ipairs(extra) do urls[#urls + 1] = u end
+    return urls
+end
+
+function PluginManager:mergeManifests(results)
+    local merged = { plugins = {} }
+    local multi = #results > 1
+    for _, r in ipairs(results) do
+        local src = source_from_url(r.url)
+        if not merged.common and r.manifest.common then
+            merged.common = r.manifest.common
+        end
+        for _, p in ipairs(r.manifest.plugins or {}) do
+            local entry = {}
+            for k, v in pairs(p) do entry[k] = v end
+            if multi then entry._source = src end
+            merged.plugins[#merged.plugins + 1] = entry
+        end
+    end
+    return merged
+end
+
+function PluginManager:showManageReposDialog()
+    self:ensureSettings()
+    local extra = self.settings:readSetting("extra_repos") or {}
+    local dlg
+    local buttons = {}
+
+    buttons[#buttons + 1] = {{
+        text    = source_from_url(MANIFEST_URL) .. "  " .. _("(default)"),
+        enabled = false,
+    }}
+
+    for i, url in ipairs(extra) do
+        local idx = i
+        buttons[#buttons + 1] = {
+            { text = source_from_url(url), enabled = false },
+            {
+                text     = _("Remove"),
+                callback = function()
+                    UIManager:close(dlg)
+                    table.remove(extra, idx)
+                    self.settings:saveSetting("extra_repos", extra)
+                    self.settings:flush()
+                    self._manifest = nil
+                    self:showManageReposDialog()
+                end,
+            },
+        }
+    end
+
+    buttons[#buttons + 1] = {{
+        text     = _("Add source\u{2026}"),
+        callback = function()
+            UIManager:close(dlg)
+            local input = InputDialog:new{
+                title      = _("Add plugin source"),
+                input_hint = "https://raw.githubusercontent.com/user/repo/main/manifest.json",
+                buttons    = {{
+                    {
+                        text     = _("Cancel"),
+                        callback = function() UIManager:close(input) end,
+                    },
+                    {
+                        text             = _("Add"),
+                        is_enter_default = true,
+                        callback         = function()
+                            local url = input:getInputText():match("^%s*(.-)%s*$")
+                            UIManager:close(input)
+                            if url == "" or url == MANIFEST_URL then return end
+                            for _, u in ipairs(extra) do
+                                if u == url then return end
+                            end
+                            extra[#extra + 1] = url
+                            self.settings:saveSetting("extra_repos", extra)
+                            self.settings:flush()
+                            self._manifest = nil
+                            UIManager:show(InfoMessage:new{
+                                text    = _("Source added. Refresh the list to load its plugins."),
+                                timeout = 3,
+                            })
+                        end,
+                    },
+                }},
+            }
+            UIManager:show(input)
+            input:onShowKeyboard()
+        end,
+    }}
+
+    buttons[#buttons + 1] = {{
+        text     = _("Close"),
+        callback = function() UIManager:close(dlg) end,
+    }}
+
+    dlg = ButtonDialog:new{ title = _("Plugin sources"), buttons = buttons }
+    UIManager:show(dlg)
 end
 
 -- ---------------------------------------------------------------------------
@@ -579,6 +713,10 @@ function PluginManager:buildMenuItems()
         text     = fetch_label,
         callback = function() self:fetchManifest() end,
     }
+    items[#items + 1] = {
+        text     = _("Manage sources\u{2026}"),
+        callback = function() self:showManageReposDialog() end,
+    }
 
     if not self._manifest then
         -- ── Offline view: only locally-installed plugins ─────────────────
@@ -614,7 +752,11 @@ function PluginManager:buildMenuItems()
     local available_entries = {}
     local known_ids         = {}
     local updates_list      = {}  -- plugins that need an update
+    local multi_source      = false
 
+    for _, p in ipairs(self._manifest.plugins) do
+        if p._source then multi_source = true end
+    end
     for _, p in ipairs(self._manifest.plugins) do
         known_ids[p.id] = true
         local inst = installed[p.id]
@@ -665,6 +807,9 @@ function PluginManager:buildMenuItems()
             if entry.has_update then
                 label = label .. "  \u{2192}  v" .. entry.plugin.version
             end
+            if multi_source and entry.plugin._source then
+                label = label .. "  (" .. entry.plugin._source .. ")"
+            end
             items[#items + 1] = {
                 text     = label,
                 callback = function()
@@ -697,8 +842,12 @@ function PluginManager:buildMenuItems()
         }
         for _, p in ipairs(available_entries) do
             local pref = p
+            local label = pref.fullname .. "  v" .. pref.version
+            if multi_source and pref._source then
+                label = label .. "  (" .. pref._source .. ")"
+            end
             items[#items + 1] = {
-                text     = pref.fullname .. "  v" .. pref.version,
+                text     = label,
                 callback = function() self:showAvailableDialog(pref) end,
             }
         end
