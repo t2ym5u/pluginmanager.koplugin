@@ -300,7 +300,7 @@ function PluginManager:ensureCommon(manifest)
         end
     end
     mkdir_p(gc_dir)
-    local base = manifest.raw_base_url .. manifest.common.dir .. "/"
+    local base = manifest.common.raw_base_url or ((manifest.raw_base_url or "") .. manifest.common.dir .. "/")
     for _, fname in ipairs(manifest.common.files) do
         local body, err = fetch_url(base .. fname)
         if not body then
@@ -315,7 +315,7 @@ end
 function PluginManager:installPlugin(plugin_info, manifest)
     local plugin_dir = _plugins_dir .. "/" .. plugin_info.dir
     mkdir_p(plugin_dir)
-    local base = manifest.raw_base_url .. plugin_info.dir .. "/"
+    local base = plugin_info.raw_base_url or ((manifest.raw_base_url or "") .. plugin_info.dir .. "/")
     for _, fname in ipairs(plugin_info.files) do
         local body, err = fetch_url(base .. fname)
         if not body then
