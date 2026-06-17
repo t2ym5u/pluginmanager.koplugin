@@ -2,10 +2,11 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
     paths:
       - '_meta.lua'
-      - 'main.lua'
+      - '*.lua'
+      - 'common/*.lua'
 
 jobs:
   release:
@@ -33,13 +34,30 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Checkout game-common
+        if: steps.check.outputs.exists == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: t2ym5u/game-common
+          path: _game_common
+
       - name: Build ZIP
         if: steps.check.outputs.exists == 'false'
         run: |
           PLUGIN="${GITHUB_REPOSITORY##*/}"
-          mkdir -p "/tmp/${PLUGIN}"
-          rsync -a --exclude='.git' --exclude='.github' . "/tmp/${PLUGIN}/"
-          cd /tmp && zip -r "${PLUGIN}.zip" "${PLUGIN}/"
+          PLUGIN_DIR="/tmp/${PLUGIN}"
+          mkdir -p "${PLUGIN_DIR}/common"
+          rsync -a --exclude='.git' --exclude='.github' --exclude='common' \
+            . "${PLUGIN_DIR}/"
+          if [ -f "common/base_board.lua" ]; then
+            # Sudoku plugin: bundle sudoku-common (already in common/)
+            cp common/*.lua "${PLUGIN_DIR}/common/"
+          else
+            # Regular plugin: bundle game-common
+            cp -r _game_common/. "${PLUGIN_DIR}/common/"
+          fi
+          cd /tmp
+          zip -r "${PLUGIN}.zip" "${PLUGIN}/"
           echo "ZIP=/tmp/${PLUGIN}.zip" >> "$GITHUB_ENV"
           echo "PLUGIN=${PLUGIN}" >> "$GITHUB_ENV"
 
@@ -50,5 +68,6 @@ jobs:
         run: |
           gh release create "v${{ steps.meta.outputs.version }}" \
             --title "v${{ steps.meta.outputs.version }}" \
-            --notes "Extract \`${PLUGIN}.zip\` into your KOReader \`plugins/\` folder." \
+            --notes "Extract \`${PLUGIN}.zip\` into your KOReader \`plugins/\` folder.
+          The \`common/\` subdirectory is bundled in the archive." \
             "$ZIP"
