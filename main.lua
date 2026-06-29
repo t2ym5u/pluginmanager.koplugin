@@ -199,7 +199,7 @@ function PluginManager:scanInstalled()
     local installed = {}
     local ok = pcall(function()
         for entry in lfs.dir(_plugins_dir) do
-            if entry:match("%.koplugin$") and entry ~= "pluginmanager.koplugin" then
+            if entry:match("%.koplugin$") then
                 local meta = read_meta(_plugins_dir .. "/" .. entry .. "/_meta.lua")
                 if meta and meta.name then
                     installed[meta.name] = {
@@ -220,6 +220,15 @@ end
 -- ---------------------------------------------------------------------------
 
 function PluginManager:fetchManifest()
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    if ok and NetworkMgr then
+        NetworkMgr:runWhenOnline(function() self:_doFetchManifest() end)
+    else
+        self:_doFetchManifest()
+    end
+end
+
+function PluginManager:_doFetchManifest()
     local notice = InfoMessage:new{ text = _("Fetching plugin list\u{2026}") }
     UIManager:show(notice)
     UIManager:scheduleIn(0.2, function()
@@ -506,12 +515,18 @@ function PluginManager:_doInstall(plugin_info, manifest)
         end
         local ok, err = self:installPlugin(plugin_info, manifest)
         if ok then
+            local is_self = plugin_info.id == "pluginmanager"
             UIManager:show(InfoMessage:new{
-                text    = string.format(
-                    _("%s v%s installed."),
-                    plugin_info.fullname, plugin_info.version
-                ),
-                timeout = 6,
+                text    = is_self
+                    and string.format(
+                        _("%s v%s installed.\nPlease restart KOReader to apply the update."),
+                        plugin_info.fullname, plugin_info.version
+                    )
+                    or  string.format(
+                        _("%s v%s installed."),
+                        plugin_info.fullname, plugin_info.version
+                    ),
+                timeout = is_self and 8 or 6,
             })
         else
             UIManager:show(InfoMessage:new{
