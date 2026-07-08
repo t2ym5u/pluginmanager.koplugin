@@ -7,12 +7,14 @@ on:
       - '_meta.lua'
       - '*.lua'
       - 'common/*.lua'
+  workflow_dispatch:
 
 jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
@@ -23,26 +25,24 @@ jobs:
           version=$(grep -oP 'version\s*=\s*"\K[^"]+' _meta.lua)
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Skip if release already exists
+      - name: Check if release already exists
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if gh release view "v${{ steps.meta.outputs.version }}" &>/dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout game-common
-        if: steps.check.outputs.exists == 'false'
         uses: actions/checkout@v4
         with:
           repository: t2ym5u/game-common
           path: _game_common
 
       - name: Build ZIP
-        if: steps.check.outputs.exists == 'false'
         run: |
           PLUGIN="${GITHUB_REPOSITORY##*/}"
           PLUGIN_DIR="/tmp/${PLUGIN}"
@@ -62,7 +62,7 @@ jobs:
           echo "PLUGIN=${PLUGIN}" >> "$GITHUB_ENV"
 
       - name: Create release
-        if: steps.check.outputs.exists == 'false'
+        if: steps.check.outputs.release_exists == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -71,3 +71,13 @@ jobs:
             --notes "Extract \`${PLUGIN}.zip\` into your KOReader \`plugins/\` folder.
           The \`common/\` subdirectory is bundled in the archive." \
             "$ZIP"
+
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Publish package to GHCR
+        run: |
+          oras push "ghcr.io/${{ github.repository }}:v${{ steps.meta.outputs.version }}" \
+            --artifact-type "application/vnd.koreader.plugin" \
+            "$ZIP:application/zip"
+          oras tag "ghcr.io/${{ github.repository }}:v${{ steps.meta.outputs.version }}" latest
