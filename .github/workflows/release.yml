@@ -80,7 +80,8 @@ jobs:
 
       - name: Publish package to GHCR
         run: |
+          cd /tmp
           oras push "ghcr.io/${{ github.repository }}:v${{ steps.meta.outputs.version }}" \
             --artifact-type "application/vnd.koreader.plugin" \
-            "$ZIP:application/zip"
+            "${PLUGIN}.zip:application/zip"
           oras tag "ghcr.io/${{ github.repository }}:v${{ steps.meta.outputs.version }}" latest
