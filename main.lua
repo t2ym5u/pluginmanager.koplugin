@@ -542,38 +542,64 @@ end
 -- ---------------------------------------------------------------------------
 
 function PluginManager:_doUpdateAll(plugins_to_update, manifest)
-    local total = #plugins_to_update
-    local msg   = InfoMessage:new{
-        text = string.format(_("Updating %d plugins\u{2026}"), total),
-    }
-    UIManager:show(msg)
-    UIManager:scheduleIn(0.2, function()
-        UIManager:close(msg)
-        -- Ensure game-common once before the loop.
-        if manifest.common then self:ensureCommon(manifest) end
-        local failed = {}
-        for _, p in ipairs(plugins_to_update) do
+    local total    = #plugins_to_update
+    local failed   = {}
+    local has_self = false
+
+    local function finish()
+        local parts = {}
+        if #failed > 0 then
+            parts[#parts + 1] = string.format(
+                _("%d/%d updated. Failures:"), total - #failed, total)
+            for _, f in ipairs(failed) do parts[#parts + 1] = f end
+        else
+            parts[#parts + 1] = string.format(_("%d plugins updated."), total)
+        end
+        if has_self then
+            parts[#parts + 1] = _("Please restart KOReader to apply the Plugin Manager update.")
+        end
+        UIManager:show(InfoMessage:new{
+            text    = table.concat(parts, "\n"),
+            timeout = has_self and 10 or 6,
+        })
+    end
+
+    local function step(i)
+        if i > total then finish() return end
+        local p   = plugins_to_update[i]
+        local msg = InfoMessage:new{
+            text = string.format(_("%d/%d  %s\u{2026}"), i, total, p.fullname),
+        }
+        UIManager:show(msg)
+        UIManager:scheduleIn(0.1, function()
+            UIManager:close(msg)
             local ok, err = self:installPlugin(p, manifest)
             if not ok then
                 failed[#failed + 1] = p.fullname .. ": " .. (err or "?")
+            elseif p.id == "pluginmanager" then
+                has_self = true
+            end
+            step(i + 1)
+        end)
+    end
+
+    local init = InfoMessage:new{
+        text = string.format(_("Updating %d plugins\u{2026}"), total),
+    }
+    UIManager:show(init)
+    UIManager:scheduleIn(0.2, function()
+        UIManager:close(init)
+        if manifest.common then
+            local ok, err = self:ensureCommon(manifest)
+            if not ok then
+                UIManager:show(InfoMessage:new{
+                    text    = _("game-common error:") .. "\n" .. (err or "?"),
+                    timeout = 5,
+                })
+                return
             end
         end
-        if #failed > 0 then
-            UIManager:show(InfoMessage:new{
-                text    = string.format(_("%d/%d updated. Failures:\n"),
-                              total - #failed, total)
-                          .. table.concat(failed, "\n"),
-                timeout = 8,
-            })
-        else
-            UIManager:show(InfoMessage:new{
-                text    = string.format(
-                    _("%d plugins updated."),
-                    total
-                ),
-                timeout = 6,
-            })
-        end
+        step(1)
     end)
 end
 
