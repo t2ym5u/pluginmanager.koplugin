@@ -14,7 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      packages: write
 
     steps:
       - uses: actions/checkout@v4
@@ -37,12 +36,14 @@ jobs:
           fi
 
       - name: Checkout game-common
+        if: steps.check.outputs.release_exists == 'false'
         uses: actions/checkout@v4
         with:
           repository: t2ym5u/game-common
           path: _game_common
 
       - name: Build ZIP
+        if: steps.check.outputs.release_exists == 'false'
         run: |
           PLUGIN="${GITHUB_REPOSITORY##*/}"
           PLUGIN_DIR="/tmp/${PLUGIN}"
@@ -50,10 +51,8 @@ jobs:
           rsync -a --exclude='.git' --exclude='.github' --exclude='common' \
             . "${PLUGIN_DIR}/"
           if [ -f "common/base_board.lua" ]; then
-            # Sudoku plugin: bundle sudoku-common (already in common/)
             cp common/*.lua "${PLUGIN_DIR}/common/"
           else
-            # Regular plugin: bundle game-common
             cp -r _game_common/. "${PLUGIN_DIR}/common/"
           fi
           cd /tmp
@@ -71,17 +70,3 @@ jobs:
             --notes "Extract \`${PLUGIN}.zip\` into your KOReader \`plugins/\` folder.
           The \`common/\` subdirectory is bundled in the archive." \
             "$ZIP"
-
-      - name: Install ORAS
-        uses: oras-project/setup-oras@v1
-
-      - name: Log in to GitHub Container Registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io --username "${{ github.actor }}" --password-stdin
-
-      - name: Publish package to GHCR
-        run: |
-          cd /tmp
-          oras push "ghcr.io/${{ github.repository }}:v${{ steps.meta.outputs.version }}" \
-            --artifact-type "application/vnd.koreader.plugin" \
-            "${PLUGIN}.zip:application/zip"
-          oras tag "ghcr.io/${{ github.repository }}:v${{ steps.meta.outputs.version }}" latest
