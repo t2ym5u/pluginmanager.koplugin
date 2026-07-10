@@ -642,12 +642,13 @@ function PluginManager:showInstalledDialog(plugin_info, inst_info, has_update)
             UIManager:close(dlg)
             -- install with the installed version, not the manifest version
             local current = {
-                id         = pref.id,
-                dir        = pref.dir,
-                fullname   = inst_info.fullname,
-                version    = inst_info.version,
-                files      = pref.files,
-                has_common = pref.has_common,
+                id           = pref.id,
+                dir          = pref.dir,
+                fullname     = inst_info.fullname,
+                version      = inst_info.version,
+                files        = pref.files,
+                has_common   = pref.has_common,
+                raw_base_url = pref.raw_base_url,
             }
             self:_doInstall(current, self._manifest)
         end,
