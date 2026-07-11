@@ -604,6 +604,63 @@ function PluginManager:_doUpdateAll(plugins_to_update, manifest)
 end
 
 -- ---------------------------------------------------------------------------
+-- Install all new
+-- ---------------------------------------------------------------------------
+
+function PluginManager:_doInstallAll(plugins_to_install, manifest)
+    local total  = #plugins_to_install
+    local failed = {}
+
+    local function finish()
+        local parts = {}
+        if #failed > 0 then
+            parts[#parts + 1] = string.format(
+                _("%d/%d installed. Failures:"), total - #failed, total)
+            for _, f in ipairs(failed) do parts[#parts + 1] = f end
+        else
+            parts[#parts + 1] = string.format(_("%d plugins installed."), total)
+        end
+        UIManager:show(InfoMessage:new{ text = table.concat(parts, "\n"), timeout = 6 })
+    end
+
+    local function step(i)
+        if i > total then finish() return end
+        local p   = plugins_to_install[i]
+        local msg = InfoMessage:new{
+            text = string.format(_("%d/%d  %s\u{2026}"), i, total, p.fullname),
+        }
+        UIManager:show(msg)
+        UIManager:scheduleIn(0.1, function()
+            UIManager:close(msg)
+            local ok, err = self:installPlugin(p, manifest)
+            if not ok then
+                failed[#failed + 1] = p.fullname .. ": " .. (err or "?")
+            end
+            step(i + 1)
+        end)
+    end
+
+    local init = InfoMessage:new{
+        text = string.format(_("Installing %d plugins\u{2026}"), total),
+    }
+    UIManager:show(init)
+    UIManager:scheduleIn(0.2, function()
+        UIManager:close(init)
+        if manifest.common then
+            local ok, err = self:ensureCommon(manifest)
+            if not ok then
+                UIManager:show(InfoMessage:new{
+                    text    = _("game-common error:") .. "\n" .. (err or "?"),
+                    timeout = 5,
+                })
+                return
+            end
+        end
+        step(1)
+    end)
+end
+
+-- ---------------------------------------------------------------------------
 -- Remove
 -- ---------------------------------------------------------------------------
 
@@ -834,6 +891,15 @@ function PluginManager:buildMenuItems()
         items[#items + 1] = {
             text     = string.format(_("Update all (%d)"), #ulist),
             callback = function() self:_doUpdateAll(ulist, self._manifest) end,
+        }
+    end
+
+    -- ── "Install all new" button ──────────────────────────────────────────
+    if #available_entries > 0 then
+        local alist = available_entries
+        items[#items + 1] = {
+            text     = string.format(_("Install all new (%d)"), #alist),
+            callback = function() self:_doInstallAll(alist, self._manifest) end,
         }
     end
 
