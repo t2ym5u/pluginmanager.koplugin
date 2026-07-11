@@ -184,7 +184,8 @@ local function read_meta(path)
     f:close()
     return {
         name     = src:match('name%s*=%s*"([^"]+)"'),
-        fullname = src:match('fullname%s*=[^"]*"([^"]*)"'),
+        fullname = src:match('fullname%s*=[^"]*"([^"]*)"')
+               or  src:match('fullname%s*=.-%[%[([^%]]-)%]%]'),
         version  = src:match('version%s*=%s*"([^"]+)"'),
     }
 end
