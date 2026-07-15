@@ -183,7 +183,9 @@ local function read_meta(path)
     local src = f:read("*a")
     f:close()
     return {
-        name     = src:match('name%s*=%s*"([^"]+)"'),
+        -- %f[%w] anchors to a word boundary so this doesn't match "name"
+        -- inside "fullname".
+        name     = src:match('%f[%w]name%s*=%s*"([^"]+)"'),
         fullname = src:match('fullname%s*=[^"]*"([^"]*)"')
                or  src:match('fullname%s*=.-%[%[([^%]]-)%]%]'),
         version  = src:match('version%s*=%s*"([^"]+)"'),
@@ -475,17 +477,30 @@ function PluginManager:installPlugin(plugin_info, manifest)
         local lfs  = get_lfs()
         local mode = lfs and lfs.attributes(common_path, "mode")
         if mode ~= "link" and mode ~= "directory" then
-            local rc = os.execute("ln -sf ../game-common " .. common_path .. " 2>/dev/null")
-            if rc ~= 0 then
-                local gc_dir = _plugins_dir .. "/game-common"
-                mkdir_p(common_path)
-                if lfs and lfs.attributes(gc_dir, "mode") == "directory" then
-                    for fname in lfs.dir(gc_dir) do
-                        if fname:match("%.lua$") then
-                            local src = io.open(gc_dir .. "/" .. fname, "rb")
-                            if src then
-                                local data = src:read("*a"); src:close()
-                                write_file(common_path .. "/" .. fname, data)
+            -- Prefer lfs.link (in-process syscall) over os.execute("ln -sf"):
+            -- forking a subprocess for every single new plugin during a bulk
+            -- "Install all new" run (potentially dozens in a row, unlike
+            -- "Update all" where the symlink already exists and this branch
+            -- is skipped) can exhaust memory on e-ink hardware and crash
+            -- KOReader partway through the batch.
+            local linked = false
+            if lfs and lfs.link then
+                local ok = pcall(lfs.link, "../game-common", common_path, true)
+                linked = ok and lfs.attributes(common_path, "mode") == "link"
+            end
+            if not linked then
+                local rc = os.execute("ln -sf ../game-common " .. common_path .. " 2>/dev/null")
+                if rc ~= 0 then
+                    local gc_dir = _plugins_dir .. "/game-common"
+                    mkdir_p(common_path)
+                    if lfs and lfs.attributes(gc_dir, "mode") == "directory" then
+                        for fname in lfs.dir(gc_dir) do
+                            if fname:match("%.lua$") then
+                                local src = io.open(gc_dir .. "/" .. fname, "rb")
+                                if src then
+                                    local data = src:read("*a"); src:close()
+                                    write_file(common_path .. "/" .. fname, data)
+                                end
                             end
                         end
                     end
