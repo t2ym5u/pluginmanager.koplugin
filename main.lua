@@ -151,6 +151,23 @@ local function mkdir_p(path)
     end
 end
 
+-- Top-level regular files directly inside `path` (directories, such as a
+-- symlinked/copied `common`, are left untouched).
+local function list_top_level_files(path)
+    local lfs = get_lfs()
+    if not lfs then return {} end
+    local files = {}
+    pcall(function()
+        for entry in lfs.dir(path) do
+            if entry ~= "." and entry ~= ".."
+               and lfs.attributes(path .. "/" .. entry, "mode") == "file" then
+                files[#files + 1] = entry
+            end
+        end
+    end)
+    return files
+end
+
 local function write_file(path, content)
     local f, err = io.open(path, "wb")
     if not f then return false, err end
@@ -216,71 +233,6 @@ function PluginManager:scanInstalled()
     end)
     if not ok then return {} end
     return installed
-end
-
--- ---------------------------------------------------------------------------
--- Manifest fetch  (manual, called from menu)
--- ---------------------------------------------------------------------------
-
-function PluginManager:fetchManifest()
-    local ok, NetworkMgr = pcall(require, "ui/network/manager")
-    if ok and NetworkMgr then
-        NetworkMgr:runWhenOnline(function() self:_doFetchManifest() end)
-    else
-        self:_doFetchManifest()
-    end
-end
-
-function PluginManager:_doFetchManifest()
-    local notice = InfoMessage:new{ text = _("Fetching plugin list\u{2026}") }
-    UIManager:show(notice)
-    UIManager:scheduleIn(0.2, function()
-        UIManager:close(notice)
-        local urls = self:getRepoURLs()
-        local results, errors = {}, {}
-        for idx, url in ipairs(urls) do
-            local body, err = fetch_url(url)
-            if body then
-                local manifest = parse_json(body)
-                if manifest and manifest.plugins then
-                    results[#results + 1] = { url = url, manifest = manifest }
-                else
-                    errors[#errors + 1] = source_from_url(url) .. ": " .. _("invalid manifest")
-                end
-            else
-                errors[#errors + 1] = source_from_url(url) .. ": " .. (err or "?")
-            end
-        end
-        if #results == 0 then
-            UIManager:show(InfoMessage:new{
-                text    = _("Network error:") .. "\n" .. table.concat(errors, "\n"),
-                timeout = 5,
-            })
-            return
-        end
-        local manifest = self:mergeManifests(results)
-        self._manifest = manifest
-        self:saveManifestCache(manifest)
-
-        local installed = self:scanInstalled()
-        local n_update, n_new = 0, 0
-        for _, p in ipairs(manifest.plugins) do
-            local inst = installed[p.id]
-            if not inst then
-                n_new = n_new + 1
-            elseif is_newer(inst.version, p.version) then
-                n_update = n_update + 1
-            end
-        end
-        local parts = {}
-        if #errors > 0 then
-            parts[#parts + 1] = string.format(_("%d source(s) unavailable"), #errors)
-        end
-        if n_update > 0 then parts[#parts+1] = string.format(_("%d update(s) available"), n_update) end
-        if n_new    > 0 then parts[#parts+1] = string.format(_("%d new plugin(s)"), n_new) end
-        if #parts   == 0 then parts[#parts+1] = _("All installed plugins are up to date.") end
-        UIManager:show(InfoMessage:new{ text = table.concat(parts, "\n"), timeout = 4 })
-    end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -410,7 +362,7 @@ function PluginManager:showManageReposDialog()
                             self.settings:flush()
                             self._manifest = nil
                             UIManager:show(InfoMessage:new{
-                                text    = _("Source added. Refresh the list to load its plugins."),
+                                text    = _("Source added. Press Update to load its plugins."),
                                 timeout = 3,
                             })
                         end,
@@ -472,6 +424,19 @@ function PluginManager:installPlugin(plugin_info, manifest)
             return false, string.format(_("Write failed: %s \u{2014} %s"), fname, werr)
         end
     end
+
+    -- Remove stale files left over from a previous version (renamed/removed
+    -- source files) that are no longer listed for this version. Only
+    -- top-level regular files are considered; `common` and any other
+    -- subdirectory are never touched here.
+    local expected = {}
+    for _, fname in ipairs(plugin_info.files) do expected[fname] = true end
+    for _, fname in ipairs(list_top_level_files(plugin_dir)) do
+        if not expected[fname] then
+            os.remove(plugin_dir .. "/" .. fname)
+        end
+    end
+
     if plugin_info.has_common then
         local common_path = plugin_dir .. "/common"
         local lfs  = get_lfs()
@@ -550,129 +515,6 @@ function PluginManager:_doInstall(plugin_info, manifest)
                 timeout = 5,
             })
         end
-    end)
-end
-
--- ---------------------------------------------------------------------------
--- Update all
--- ---------------------------------------------------------------------------
-
-function PluginManager:_doUpdateAll(plugins_to_update, manifest)
-    local total    = #plugins_to_update
-    local failed   = {}
-    local has_self = false
-
-    local function finish()
-        local parts = {}
-        if #failed > 0 then
-            parts[#parts + 1] = string.format(
-                _("%d/%d updated. Failures:"), total - #failed, total)
-            for _, f in ipairs(failed) do parts[#parts + 1] = f end
-        else
-            parts[#parts + 1] = string.format(_("%d plugins updated."), total)
-        end
-        if has_self then
-            parts[#parts + 1] = _("Please restart KOReader to apply the Plugin Manager update.")
-        end
-        UIManager:show(InfoMessage:new{
-            text    = table.concat(parts, "\n"),
-            timeout = has_self and 10 or 6,
-        })
-    end
-
-    local function step(i)
-        if i > total then finish() return end
-        local p   = plugins_to_update[i]
-        local msg = InfoMessage:new{
-            text = string.format(_("%d/%d  %s\u{2026}"), i, total, p.fullname),
-        }
-        UIManager:show(msg)
-        UIManager:scheduleIn(0.1, function()
-            UIManager:close(msg)
-            local ok, err = self:installPlugin(p, manifest)
-            if not ok then
-                failed[#failed + 1] = p.fullname .. ": " .. (err or "?")
-            elseif p.id == "pluginmanager" then
-                has_self = true
-            end
-            step(i + 1)
-        end)
-    end
-
-    local init = InfoMessage:new{
-        text = string.format(_("Updating %d plugins\u{2026}"), total),
-    }
-    UIManager:show(init)
-    UIManager:scheduleIn(0.2, function()
-        UIManager:close(init)
-        if manifest.common then
-            local ok, err = self:ensureCommon(manifest)
-            if not ok then
-                UIManager:show(InfoMessage:new{
-                    text    = _("game-common error:") .. "\n" .. (err or "?"),
-                    timeout = 5,
-                })
-                return
-            end
-        end
-        step(1)
-    end)
-end
-
--- ---------------------------------------------------------------------------
--- Install all new
--- ---------------------------------------------------------------------------
-
-function PluginManager:_doInstallAll(plugins_to_install, manifest)
-    local total  = #plugins_to_install
-    local failed = {}
-
-    local function finish()
-        local parts = {}
-        if #failed > 0 then
-            parts[#parts + 1] = string.format(
-                _("%d/%d installed. Failures:"), total - #failed, total)
-            for _, f in ipairs(failed) do parts[#parts + 1] = f end
-        else
-            parts[#parts + 1] = string.format(_("%d plugins installed."), total)
-        end
-        UIManager:show(InfoMessage:new{ text = table.concat(parts, "\n"), timeout = 6 })
-    end
-
-    local function step(i)
-        if i > total then finish() return end
-        local p   = plugins_to_install[i]
-        local msg = InfoMessage:new{
-            text = string.format(_("%d/%d  %s\u{2026}"), i, total, p.fullname),
-        }
-        UIManager:show(msg)
-        UIManager:scheduleIn(0.1, function()
-            UIManager:close(msg)
-            local ok, err = self:installPlugin(p, manifest)
-            if not ok then
-                failed[#failed + 1] = p.fullname .. ": " .. (err or "?")
-            end
-            step(i + 1)
-        end)
-    end
-
-    local init = InfoMessage:new{
-        text = string.format(_("Installing %d plugins\u{2026}"), total),
-    }
-    UIManager:show(init)
-    UIManager:scheduleIn(0.2, function()
-        UIManager:close(init)
-        if manifest.common then
-            local ok, err = self:ensureCommon(manifest)
-            if not ok then
-                UIManager:show(InfoMessage:new{
-                    text    = _("game-common error:") .. "\n" .. (err or "?"),
-                    timeout = 5,
-                })
-                return
-            end
-        end
-        step(1)
     end)
 end
 
@@ -804,180 +646,260 @@ function PluginManager:showLocalOnlyDialog(inst_info)
 end
 
 -- ---------------------------------------------------------------------------
--- Dynamic menu
+-- Plugin list popup (paginated)
 -- ---------------------------------------------------------------------------
 
-function PluginManager:buildMenuItems()
+function PluginManager:showPluginList()
+    local Menu   = require("ui/widget/menu")
+    local Screen = require("device/screen")
+
     local installed = self:scanInstalled()
     local items     = {}
 
-    -- ── Fetch / refresh button ───────────────────────────────────────────
-    local fetch_label
-    if self._last_check then
-        local age_min = math.floor((os.time() - self._last_check) / 60)
-        if age_min < 60 then
-            fetch_label = string.format(_("Refresh list (last: %d min ago)"), age_min)
-        else
-            local age_h = math.floor(age_min / 60)
-            fetch_label = string.format(_("Refresh list (last: %dh ago)"), age_h)
-        end
-    else
-        fetch_label = _("Fetch plugin list")
-    end
-    items[#items + 1] = {
-        text     = fetch_label,
-        callback = function() self:fetchManifest() end,
-    }
-    items[#items + 1] = {
-        text     = _("Manage sources\u{2026}"),
-        callback = function() self:showManageReposDialog() end,
-    }
-
     if not self._manifest then
-        -- ── Offline view: only locally-installed plugins ─────────────────
-        local local_entries = {}
+        -- Offline: show only locally-installed plugins
         for _, inst in pairs(installed) do
-            local_entries[#local_entries + 1] = inst
-        end
-        table.sort(local_entries, function(a, b) return a.fullname < b.fullname end)
-
-        if #local_entries > 0 then
-            items[#items + 1] = {
-                text    = string.format(_("\u{2014} Installed (%d) \u{2014}"), #local_entries),
-                enabled = false,
-            }
-            for _, inst in ipairs(local_entries) do
-                local iref = inst
-                items[#items + 1] = {
-                    text     = iref.fullname .. "  v" .. iref.version,
-                    callback = function() self:showLocalOnlyDialog(iref) end,
-                }
-            end
-        else
-            items[#items + 1] = {
-                text    = _("No plugins installed yet."),
-                enabled = false,
-            }
-        end
-        return items
-    end
-
-    -- ── With manifest: compute update/new counts ─────────────────────────
-    local installed_entries = {}
-    local available_entries = {}
-    local known_ids         = {}
-    local updates_list      = {}  -- plugins that need an update
-    local multi_source      = false
-
-    for _, p in ipairs(self._manifest.plugins) do
-        if p._source then multi_source = true end
-    end
-    for _, p in ipairs(self._manifest.plugins) do
-        known_ids[p.id] = true
-        local inst = installed[p.id]
-        if inst then
-            local has_update = is_newer(inst.version, p.version)
-            installed_entries[#installed_entries + 1] = {
-                plugin     = p,
-                inst       = inst,
-                has_update = has_update,
-            }
-            if has_update then updates_list[#updates_list + 1] = p end
-        else
-            available_entries[#available_entries + 1] = p
-        end
-    end
-
-    local local_only = {}
-    for id, inst in pairs(installed) do
-        if not known_ids[id] then
-            local_only[#local_only + 1] = inst
-        end
-    end
-
-    table.sort(installed_entries, function(a, b)
-        return a.inst.fullname < b.inst.fullname
-    end)
-    table.sort(available_entries, function(a, b) return a.fullname < b.fullname end)
-    table.sort(local_only,        function(a, b) return a.fullname < b.fullname end)
-
-    -- ── "Update all" button (only when there is something to update) ──────
-    if #updates_list > 0 then
-        local ulist = updates_list
-        items[#items + 1] = {
-            text     = string.format(_("Update all (%d)"), #ulist),
-            callback = function() self:_doUpdateAll(ulist, self._manifest) end,
-        }
-    end
-
-    -- ── "Install all new" button ──────────────────────────────────────────
-    if #available_entries > 0 then
-        local alist = available_entries
-        items[#items + 1] = {
-            text     = string.format(_("Install all new (%d)"), #alist),
-            callback = function() self:_doInstallAll(alist, self._manifest) end,
-        }
-    end
-
-    -- ── Installed (from manifest) ─────────────────────────────────────────
-    if #installed_entries > 0 then
-        items[#items + 1] = {
-            text    = string.format(_("\u{2014} Installed (%d) \u{2014}"), #installed_entries),
-            enabled = false,
-        }
-        for _, e in ipairs(installed_entries) do
-            local entry = e
-            local label = entry.inst.fullname .. "  v" .. entry.inst.version
-            if entry.has_update then
-                label = label .. "  \u{2192}  v" .. entry.plugin.version
-            end
-            if multi_source and entry.plugin._source then
-                label = label .. "  (" .. entry.plugin._source .. ")"
-            end
-            items[#items + 1] = {
-                text     = label,
-                callback = function()
-                    self:showInstalledDialog(entry.plugin, entry.inst, entry.has_update)
-                end,
-            }
-        end
-    end
-
-    -- ── Installed locally but not in the manifest ─────────────────────────
-    if #local_only > 0 then
-        items[#items + 1] = {
-            text    = string.format(_("\u{2014} Installed, not in repo (%d) \u{2014}"), #local_only),
-            enabled = false,
-        }
-        for _, inst in ipairs(local_only) do
             local iref = inst
             items[#items + 1] = {
-                text     = iref.fullname .. "  v" .. iref.version,
-                callback = function() self:showLocalOnlyDialog(iref) end,
+                text      = iref.fullname,
+                mandatory = "v" .. iref.version,
+                callback  = function() self:showLocalOnlyDialog(iref) end,
             }
         end
-    end
-
-    -- ── Available to install ──────────────────────────────────────────────
-    if #available_entries > 0 then
-        items[#items + 1] = {
-            text    = string.format(_("\u{2014} Available (%d) \u{2014}"), #available_entries),
-            enabled = false,
-        }
-        for _, p in ipairs(available_entries) do
-            local pref = p
-            local label = pref.fullname .. "  v" .. pref.version
-            if multi_source and pref._source then
-                label = label .. "  (" .. pref._source .. ")"
+        table.sort(items, function(a, b) return a.text < b.text end)
+        if #items == 0 then
+            UIManager:show(InfoMessage:new{
+                text    = _("No plugins installed.\nPress Update to fetch the list."),
+                timeout = 3,
+            })
+            return
+        end
+    else
+        local known_ids = {}
+        for _, p in ipairs(self._manifest.plugins) do
+            known_ids[p.id] = true
+            local inst = installed[p.id]
+            if inst then
+                local has_update = is_newer(inst.version, p.version)
+                local detail = has_update
+                    and ("v" .. inst.version .. " \u{2192} v" .. p.version)
+                    or  ("v" .. inst.version)
+                local entry = { plugin = p, inst = inst, has_update = has_update }
+                items[#items + 1] = {
+                    text      = inst.fullname,
+                    mandatory = detail,
+                    bold      = has_update,
+                    callback  = function()
+                        self:showInstalledDialog(entry.plugin, entry.inst, entry.has_update)
+                    end,
+                }
+            else
+                local pref = p
+                items[#items + 1] = {
+                    text      = p.fullname,
+                    mandatory = "v" .. p.version,
+                    dim       = true,
+                    callback  = function() self:showAvailableDialog(pref) end,
+                }
             end
-            items[#items + 1] = {
-                text     = label,
-                callback = function() self:showAvailableDialog(pref) end,
-            }
         end
+        -- Locally installed but absent from manifest
+        for id, inst in pairs(installed) do
+            if not known_ids[id] then
+                local iref = inst
+                items[#items + 1] = {
+                    text      = inst.fullname,
+                    mandatory = "v" .. inst.version .. " (local)",
+                    callback  = function() self:showLocalOnlyDialog(iref) end,
+                }
+            end
+        end
+        table.sort(items, function(a, b) return a.text < b.text end)
     end
 
-    return items
+    local menu_instance
+    menu_instance = Menu:new{
+        title      = _("Plugins"),
+        item_table = items,
+        width      = Screen:getWidth(),
+        height     = Screen:getHeight(),
+    }
+    function menu_instance:onMenuChoice(item)
+        UIManager:close(self)
+        if item.callback then item.callback() end
+    end
+    UIManager:show(menu_instance)
+end
+
+-- ---------------------------------------------------------------------------
+-- Full update (fetch manifest + install new + update existing)
+-- ---------------------------------------------------------------------------
+
+function PluginManager:doFullUpdate()
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    if ok and NetworkMgr then
+        NetworkMgr:runWhenOnline(function() self:_doFullUpdate() end)
+    else
+        self:_doFullUpdate()
+    end
+end
+
+function PluginManager:_doFullUpdate()
+    local notice = InfoMessage:new{ text = _("Fetching plugin list\u{2026}") }
+    UIManager:show(notice)
+    UIManager:scheduleIn(0.2, function()
+        UIManager:close(notice)
+        local urls = self:getRepoURLs()
+        local results, errors = {}, {}
+        for _, url in ipairs(urls) do
+            local body, err = fetch_url(url)
+            if body then
+                local manifest = parse_json(body)
+                if manifest and manifest.plugins then
+                    results[#results + 1] = { url = url, manifest = manifest }
+                else
+                    errors[#errors + 1] = source_from_url(url) .. ": " .. _("invalid manifest")
+                end
+            else
+                errors[#errors + 1] = source_from_url(url) .. ": " .. (err or "?")
+            end
+        end
+        if #results == 0 then
+            UIManager:show(InfoMessage:new{
+                text    = _("Network error:") .. "\n" .. table.concat(errors, "\n"),
+                timeout = 5,
+            })
+            return
+        end
+        local manifest = self:mergeManifests(results)
+        self._manifest = manifest
+        self:saveManifestCache(manifest)
+
+        local installed  = self:scanInstalled()
+        local to_process = {}
+
+        for _, p in ipairs(manifest.plugins) do
+            local inst = installed[p.id]
+            if not inst or is_newer(inst.version, p.version) then
+                to_process[#to_process + 1] = p
+            end
+        end
+
+        if #to_process == 0 then
+            local parts = {}
+            if #errors > 0 then
+                parts[#parts + 1] = string.format(_("%d source(s) unavailable"), #errors)
+            end
+            parts[#parts + 1] = _("All plugins are up to date.")
+            UIManager:show(InfoMessage:new{
+                text    = table.concat(parts, "\n"),
+                timeout = 4,
+            })
+            return
+        end
+
+        local total    = #to_process
+        local failed   = {}
+        local has_self = false
+
+        local function finish()
+            local parts = {}
+            if #errors > 0 then
+                parts[#parts + 1] = string.format(_("%d source(s) unavailable"), #errors)
+            end
+            if #failed > 0 then
+                parts[#parts + 1] = string.format(
+                    _("%d/%d done. Failures:"), total - #failed, total)
+                for _, f in ipairs(failed) do parts[#parts + 1] = f end
+            else
+                parts[#parts + 1] = string.format(_("%d plugin(s) updated/installed."), total)
+            end
+            if has_self then
+                parts[#parts + 1] = _("Please restart KOReader to apply the Plugin Manager update.")
+            end
+            UIManager:show(InfoMessage:new{
+                text    = table.concat(parts, "\n"),
+                timeout = has_self and 10 or 6,
+            })
+        end
+
+        local function step(i)
+            if i > total then finish() return end
+            local p   = to_process[i]
+            local msg = InfoMessage:new{
+                text = string.format(_("%d/%d  %s\u{2026}"), i, total, p.fullname),
+            }
+            UIManager:show(msg)
+            UIManager:scheduleIn(0.1, function()
+                UIManager:close(msg)
+                local ok, err = self:installPlugin(p, manifest)
+                if not ok then
+                    failed[#failed + 1] = p.fullname .. ": " .. (err or "?")
+                elseif p.id == "pluginmanager" then
+                    has_self = true
+                end
+                step(i + 1)
+            end)
+        end
+
+        local init_msg = InfoMessage:new{
+            text = string.format(_("Updating %d plugin(s)\u{2026}"), total),
+        }
+        UIManager:show(init_msg)
+        UIManager:scheduleIn(0.2, function()
+            UIManager:close(init_msg)
+            if manifest.common then
+                local ok, err = self:ensureCommon(manifest)
+                if not ok then
+                    UIManager:show(InfoMessage:new{
+                        text    = _("game-common error:") .. "\n" .. (err or "?"),
+                        timeout = 5,
+                    })
+                    return
+                end
+            end
+            step(1)
+        end)
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Main dialog
+-- ---------------------------------------------------------------------------
+
+function PluginManager:showMainDialog()
+    local dlg
+    dlg = ButtonDialog:new{
+        title   = _("Plugin Manager"),
+        buttons = {
+            {{
+                text     = _("Update"),
+                callback = function()
+                    UIManager:close(dlg)
+                    self:doFullUpdate()
+                end,
+            }},
+            {{
+                text     = _("Plugin list"),
+                callback = function()
+                    UIManager:close(dlg)
+                    self:showPluginList()
+                end,
+            }},
+            {{
+                text     = _("Manage sources\u{2026}"),
+                callback = function()
+                    UIManager:close(dlg)
+                    self:showManageReposDialog()
+                end,
+            }},
+            {{
+                text     = _("Close"),
+                callback = function() UIManager:close(dlg) end,
+            }},
+        },
+    }
+    UIManager:show(dlg)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1000,9 +922,9 @@ end
 
 function PluginManager:addToMainMenu(menu_items)
     menu_items.pluginmanager = {
-        text                = _("Plugin Manager"),
-        sorting_hint        = "tools",
-        sub_item_table_func = function() return self:buildMenuItems() end,
+        text         = _("Plugin Manager"),
+        sorting_hint = "tools",
+        callback     = function() self:showMainDialog() end,
     }
 end
 
