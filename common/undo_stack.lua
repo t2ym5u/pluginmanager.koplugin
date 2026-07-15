@@ -1,4 +1,4 @@
-local _ = require("gettext")
+local _ = require("i18n")
 
 -- ---------------------------------------------------------------------------
 -- UndoStack — generic undo / redo stack

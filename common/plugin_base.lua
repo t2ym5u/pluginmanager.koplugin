@@ -2,7 +2,8 @@ local DataStorage     = require("datastorage")
 local LuaSettings     = require("luasettings")
 local UIManager       = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
-local _               = require("gettext")
+local _               = require("i18n")
+local StatsExporter   = require("stats_exporter")
 
 -- ---------------------------------------------------------------------------
 -- PluginBase — shared plugin lifecycle for all game plugins
@@ -86,11 +87,20 @@ end
 
 function PluginBase:showGame()
     if self.screen then return end
+    self._session_start = os.time()
     self.screen = self:createScreen()
     UIManager:show(self.screen)
 end
 
 function PluginBase:onScreenClosed()
+    local elapsed = self._session_start and (os.time() - self._session_start) or 0
+    self._session_start = nil
+    local cur = StatsExporter:get(self.name) or {}
+    StatsExporter:record(self.name, {
+        sessions    = (cur.sessions or 0) + 1,
+        last_played = os.time(),
+        time_played = (cur.time_played or 0) + elapsed,
+    })
     self.screen = nil
 end
 
