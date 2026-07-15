@@ -238,7 +238,7 @@ function PluginManager:_doFetchManifest()
         UIManager:close(notice)
         local urls = self:getRepoURLs()
         local results, errors = {}, {}
-        for _, url in ipairs(urls) do
+        for idx, url in ipairs(urls) do
             local body, err = fetch_url(url)
             if body then
                 local manifest = parse_json(body)
@@ -462,7 +462,7 @@ function PluginManager:installPlugin(plugin_info, manifest)
     local plugin_dir = _plugins_dir .. "/" .. plugin_info.dir
     mkdir_p(plugin_dir)
     local base = plugin_info.raw_base_url or ((manifest.raw_base_url or "") .. plugin_info.dir .. "/")
-    for _, fname in ipairs(plugin_info.files) do
+    for idx, fname in ipairs(plugin_info.files) do
         local body, err = fetch_url(base .. fname)
         if not body then
             return false, string.format(_("Download failed: %s \u{2014} %s"), fname, err)
