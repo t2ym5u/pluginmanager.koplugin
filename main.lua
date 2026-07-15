@@ -9,10 +9,24 @@ local InputDialog     = require("ui/widget/inputdialog")
 local LuaSettings     = require("luasettings")
 local UIManager       = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local logger          = require("logger")
 local _               = require("gettext")
 
 local MANIFEST_URL   = "https://raw.githubusercontent.com/t2ym5u/koreader-plugins/master/manifest.json"
 local AUTO_CHECK_TTL = 86400  -- re-check automatically at most once every 24 h
+
+-- Runs fn(...) shielded from Lua errors (a bad manifest entry, an
+-- unexpected nil, a third-party source with malformed data...). Any escape
+-- is logged to crash.log and turned into a normal (false, message) result,
+-- so one broken plugin can never abort the rest of a bulk update.
+local function safe_call(fn, ...)
+    local ok, a, b = pcall(fn, ...)
+    if not ok then
+        logger.warn("PluginManager:", a)
+        return false, tostring(a)
+    end
+    return a, b
+end
 
 local function source_from_url(url)
     local user = url:match("raw%.githubusercontent%.com/([^/]+)/")
@@ -485,8 +499,9 @@ function PluginManager:_doInstall(plugin_info, manifest)
     UIManager:scheduleIn(0.2, function()
         UIManager:close(msg)
         if plugin_info.has_common and manifest.common then
-            local ok, err = self:ensureCommon(manifest)
+            local ok, err = safe_call(function() return self:ensureCommon(manifest) end)
             if not ok then
+                logger.warn("PluginManager: game-common error:", err)
                 UIManager:show(InfoMessage:new{
                     text    = _("game-common error:") .. "\n" .. (err or "?"),
                     timeout = 5,
@@ -494,7 +509,7 @@ function PluginManager:_doInstall(plugin_info, manifest)
                 return
             end
         end
-        local ok, err = self:installPlugin(plugin_info, manifest)
+        local ok, err = safe_call(function() return self:installPlugin(plugin_info, manifest) end)
         if ok then
             local is_self = plugin_info.id == "pluginmanager"
             UIManager:show(InfoMessage:new{
@@ -510,6 +525,7 @@ function PluginManager:_doInstall(plugin_info, manifest)
                 timeout = is_self and 8 or 6,
             })
         else
+            logger.warn("PluginManager: install failed for", plugin_info.id, ":", err)
             UIManager:show(InfoMessage:new{
                 text    = _("Install failed:") .. "\n" .. (err or "?"),
                 timeout = 5,
@@ -832,12 +848,15 @@ function PluginManager:_doFullUpdate()
             UIManager:show(msg)
             UIManager:scheduleIn(0.1, function()
                 UIManager:close(msg)
-                local ok, err = self:installPlugin(p, manifest)
+                local ok, err = safe_call(function() return self:installPlugin(p, manifest) end)
                 if not ok then
+                    logger.warn("PluginManager: update failed for", p.id, ":", err)
                     failed[#failed + 1] = p.fullname .. ": " .. (err or "?")
                 elseif p.id == "pluginmanager" then
                     has_self = true
                 end
+                -- Always advance, even after a failure above: one broken
+                -- plugin must not stop the rest of a bulk update.
                 step(i + 1)
             end)
         end
@@ -849,8 +868,9 @@ function PluginManager:_doFullUpdate()
         UIManager:scheduleIn(0.2, function()
             UIManager:close(init_msg)
             if manifest.common then
-                local ok, err = self:ensureCommon(manifest)
+                local ok, err = safe_call(function() return self:ensureCommon(manifest) end)
                 if not ok then
+                    logger.warn("PluginManager: game-common error:", err)
                     UIManager:show(InfoMessage:new{
                         text    = _("game-common error:") .. "\n" .. (err or "?"),
                         timeout = 5,
