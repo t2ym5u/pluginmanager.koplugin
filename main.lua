@@ -433,6 +433,10 @@ function PluginManager:installPlugin(plugin_info, manifest)
         if not body then
             return false, string.format(_("Download failed: %s \u{2014} %s"), fname, err)
         end
+        local subdir = fname:match("^(.*)/[^/]+$")
+        if subdir then
+            mkdir_p(plugin_dir .. "/" .. subdir)
+        end
         local ok, werr = write_file(plugin_dir .. "/" .. fname, body)
         if not ok then
             return false, string.format(_("Write failed: %s \u{2014} %s"), fname, werr)
