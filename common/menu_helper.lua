@@ -1,7 +1,7 @@
 local Device     = require("device")
 local Menu       = require("ui/widget/menu")
 local UIManager  = require("ui/uimanager")
-local _          = require("gettext")
+local _          = require("i18n")
 
 local DeviceScreen = Device.screen
 

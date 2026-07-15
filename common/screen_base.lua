@@ -1,4 +1,5 @@
 local Blitbuffer      = require("ffi/blitbuffer")
+local ButtonDialog    = require("ui/widget/buttondialog")
 local Device          = require("device")
 local Font            = require("ui/font")
 local Geom            = require("ui/geometry")
@@ -6,10 +7,11 @@ local InfoMessage     = require("ui/widget/infomessage")
 local InputContainer  = require("ui/widget/container/inputcontainer")
 local TextViewer      = require("ui/widget/textviewer")
 local TextWidget      = require("ui/widget/textwidget")
+local TitleBar        = require("ui/widget/titlebar")
 local UIManager       = require("ui/uimanager")
 local VerticalGroup   = require("ui/widget/verticalgroup")
 local VerticalSpan    = require("ui/widget/verticalspan")
-local _               = require("gettext")
+local _               = require("i18n")
 
 local DeviceScreen = Device.screen
 
@@ -96,6 +98,55 @@ function ScreenBase:closeScreen()
 end
 
 -- ---------------------------------------------------------------------------
+-- TitleBar helpers
+-- ---------------------------------------------------------------------------
+
+-- Build a standard TitleBar with a hamburger menu on the left and close on
+-- the right.  options_fn is called each time the menu opens and must return
+-- a list of { text, callback } items — texts are therefore always fresh.
+function ScreenBase:buildTitleBar(title, options_fn)
+    local self_ref = self
+    return TitleBar:new{
+        width                  = DeviceScreen:getWidth(),
+        title                  = title,
+        left_icon              = "appbar.menu",
+        left_icon_tap_callback = function()
+            local dlg
+            local buttons = {}
+            for _, item in ipairs(options_fn()) do
+                local cb = item.callback
+                buttons[#buttons + 1] = {{ text = item.text, callback = function()
+                    UIManager:close(dlg)
+                    cb()
+                end }}
+            end
+            dlg = ButtonDialog:new{ title = title, buttons = buttons }
+            UIManager:show(dlg)
+        end,
+        close_callback = function() self_ref:closeScreen() end,
+        with_bottom_line = true,
+    }
+end
+
+-- Build a full-screen landscape layout with title_bar pinned to top and
+-- content centred vertically in the remaining space.
+function ScreenBase:buildLandscapeLayout(title_bar, content)
+    local sh       = self.dimen.h
+    local tb_h     = title_bar:getSize().h
+    local avail_h  = sh - tb_h
+    local cont_h   = content:getSize().h
+    local top_span = math.max(0, math.floor((avail_h - cont_h) / 2))
+    local bot_span = math.max(0, avail_h - top_span - cont_h)
+    self.layout = VerticalGroup:new{
+        title_bar,
+        VerticalSpan:new{ width = top_span },
+        content,
+        VerticalSpan:new{ width = bot_span },
+    }
+    self[1] = self.layout
+end
+
+-- ---------------------------------------------------------------------------
 -- Fixed portrait layout helper
 -- ---------------------------------------------------------------------------
 
@@ -169,8 +220,7 @@ function ScreenBase:makeRulesButtonConfig(en_text, fr_text)
     return {
         text     = _("Rules"),
         callback = function()
-            local lang = (G_reader_settings and G_reader_settings:readSetting("language") or "en"):sub(1, 2)
-            self:showRules((lang == "fr" and fr_text) or en_text)
+            self:showRules((_.lang() == "fr" and fr_text) or en_text)
         end,
     }
 end
