@@ -15,6 +15,14 @@ local _               = require("gettext")
 local MANIFEST_URL   = "https://raw.githubusercontent.com/t2ym5u/koreader-plugins/master/manifest.json"
 local AUTO_CHECK_TTL = 86400  -- re-check automatically at most once every 24 h
 
+-- Shared-library keys: manifest.json top-level sections describing a
+-- downloadable common/ bundle, one per shared-code family (see the
+-- project-sudoku-common-architecture memory — game-common's ScreenBase and
+-- sudoku-common's BaseScreen are NOT interchangeable). Each plugin_info
+-- names the one it needs via plugin_info.common_lib, e.g. "common" or
+-- "sudoku_common", which indexes straight into this list / into manifest.
+local COMMON_LIB_KEYS = { "common", "sudoku_common" }
+
 -- Runs fn(...) shielded from Lua errors (a bad manifest entry, an
 -- unexpected nil, a third-party source with malformed data...). Any escape
 -- is logged to crash.log and turned into a normal (false, message) result,
@@ -307,8 +315,10 @@ function PluginManager:mergeManifests(results)
     local multi = #results > 1
     for _, r in ipairs(results) do
         local src = source_from_url(r.url)
-        if not merged.common and r.manifest.common then
-            merged.common = r.manifest.common
+        for _, lib_key in ipairs(COMMON_LIB_KEYS) do
+            if not merged[lib_key] and r.manifest[lib_key] then
+                merged[lib_key] = r.manifest[lib_key]
+            end
         end
         for _, p in ipairs(r.manifest.plugins or {}) do
             local entry = {}
@@ -401,26 +411,27 @@ end
 -- Install helpers
 -- ---------------------------------------------------------------------------
 
-function PluginManager:ensureCommon(manifest)
-    local gc_dir = _plugins_dir .. "/game-common"
-    local lfs    = get_lfs()
-    if lfs and lfs.attributes(gc_dir, "mode") == "directory" then
-        local vf = io.open(gc_dir .. "/.version", "r")
+function PluginManager:ensureCommon(manifest, lib_key)
+    local spec = manifest[lib_key]
+    local lib_dir = _plugins_dir .. "/" .. spec.dir
+    local lfs     = get_lfs()
+    if lfs and lfs.attributes(lib_dir, "mode") == "directory" then
+        local vf = io.open(lib_dir .. "/.version", "r")
         if vf then
             local v = vf:read("*l"); vf:close()
-            if not is_newer(v or "0", manifest.common.version) then return true end
+            if not is_newer(v or "0", spec.version) then return true end
         end
     end
-    mkdir_p(gc_dir)
-    local base = manifest.common.raw_base_url or ((manifest.raw_base_url or "") .. manifest.common.dir .. "/")
-    for _, fname in ipairs(manifest.common.files) do
+    mkdir_p(lib_dir)
+    local base = spec.raw_base_url or ((manifest.raw_base_url or "") .. spec.dir .. "/")
+    for _, fname in ipairs(spec.files) do
         local body, err = fetch_url(base .. fname)
         if not body then
-            return false, string.format("game-common/%s: %s", fname, err)
+            return false, string.format("%s/%s: %s", spec.dir, fname, err)
         end
-        write_file(gc_dir .. "/" .. fname, body)
+        write_file(lib_dir .. "/" .. fname, body)
     end
-    write_file(gc_dir .. "/.version", manifest.common.version)
+    write_file(lib_dir .. "/.version", spec.version)
     return true
 end
 
@@ -455,7 +466,9 @@ function PluginManager:installPlugin(plugin_info, manifest)
         end
     end
 
-    if plugin_info.has_common then
+    if plugin_info.common_lib then
+        local spec = manifest[plugin_info.common_lib]
+        local lib_relpath = "../" .. spec.dir
         local common_path = plugin_dir .. "/common"
         local lfs  = get_lfs()
         local mode = lfs and lfs.attributes(common_path, "mode")
@@ -468,18 +481,18 @@ function PluginManager:installPlugin(plugin_info, manifest)
             -- KOReader partway through the batch.
             local linked = false
             if lfs and lfs.link then
-                local ok = pcall(lfs.link, "../game-common", common_path, true)
+                local ok = pcall(lfs.link, lib_relpath, common_path, true)
                 linked = ok and lfs.attributes(common_path, "mode") == "link"
             end
             if not linked then
-                local rc = os.execute("ln -sf ../game-common " .. common_path .. " 2>/dev/null")
+                local rc = os.execute("ln -sf " .. lib_relpath .. " " .. common_path .. " 2>/dev/null")
                 if rc ~= 0 then
-                    local gc_dir = _plugins_dir .. "/game-common"
+                    local lib_dir = _plugins_dir .. "/" .. spec.dir
                     mkdir_p(common_path)
-                    if lfs and lfs.attributes(gc_dir, "mode") == "directory" then
-                        for fname in lfs.dir(gc_dir) do
+                    if lfs and lfs.attributes(lib_dir, "mode") == "directory" then
+                        for fname in lfs.dir(lib_dir) do
                             if fname:match("%.lua$") then
-                                local src = io.open(gc_dir .. "/" .. fname, "rb")
+                                local src = io.open(lib_dir .. "/" .. fname, "rb")
                                 if src then
                                     local data = src:read("*a"); src:close()
                                     write_file(common_path .. "/" .. fname, data)
@@ -502,12 +515,12 @@ function PluginManager:_doInstall(plugin_info, manifest)
     UIManager:show(msg)
     UIManager:scheduleIn(0.2, function()
         UIManager:close(msg)
-        if plugin_info.has_common and manifest.common then
-            local ok, err = safe_call(function() return self:ensureCommon(manifest) end)
+        if plugin_info.common_lib and manifest[plugin_info.common_lib] then
+            local ok, err = safe_call(function() return self:ensureCommon(manifest, plugin_info.common_lib) end)
             if not ok then
-                logger.warn("PluginManager: game-common error:", err)
+                logger.warn("PluginManager: " .. plugin_info.common_lib .. " error:", err)
                 UIManager:show(InfoMessage:new{
-                    text    = _("game-common error:") .. "\n" .. (err or "?"),
+                    text    = _("Shared library error:") .. "\n" .. (err or "?"),
                     timeout = 5,
                 })
                 return
@@ -582,7 +595,7 @@ function PluginManager:showInstalledDialog(plugin_info, inst_info, has_update)
                 fullname     = inst_info.fullname,
                 version      = inst_info.version,
                 files        = pref.files,
-                has_common   = pref.has_common,
+                common_lib   = pref.common_lib,
                 raw_base_url = pref.raw_base_url,
             }
             self:_doInstall(current, self._manifest)
@@ -871,12 +884,18 @@ function PluginManager:_doFullUpdate()
         UIManager:show(init_msg)
         UIManager:scheduleIn(0.2, function()
             UIManager:close(init_msg)
-            if manifest.common then
-                local ok, err = safe_call(function() return self:ensureCommon(manifest) end)
+            local needed_libs = {}
+            for _, p in ipairs(to_process) do
+                if p.common_lib and manifest[p.common_lib] then
+                    needed_libs[p.common_lib] = true
+                end
+            end
+            for lib_key in pairs(needed_libs) do
+                local ok, err = safe_call(function() return self:ensureCommon(manifest, lib_key) end)
                 if not ok then
-                    logger.warn("PluginManager: game-common error:", err)
+                    logger.warn("PluginManager: " .. lib_key .. " error:", err)
                     UIManager:show(InfoMessage:new{
-                        text    = _("game-common error:") .. "\n" .. (err or "?"),
+                        text    = _("Shared library error:") .. "\n" .. (err or "?"),
                         timeout = 5,
                     })
                     return
