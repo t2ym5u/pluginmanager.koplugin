@@ -47,7 +47,7 @@ After installing or removing a plugin, **restart KOReader** for the change to ta
 
 The plugin manager downloads a `manifest.json` file from the repository root. This file lists every available plugin along with its version and the individual source files it contains. Files are then fetched one by one from `raw.githubusercontent.com` and written directly to the KOReader `plugins/` directory.
 
-The shared `game-common` library is downloaded automatically the first time any game plugin that depends on it is installed. Subsequent installs reuse the cached copy unless a newer version is available.
+Two shared libraries exist for plugins that vendor common code instead of duplicating it: `game-common` (ScreenBase-based games) and `sudoku-common` (BaseScreen-based sudoku variants — a different, incompatible API). A plugin's `common_lib` field in `manifest.json` names which one it needs. The named library is downloaded automatically the first time any plugin that depends on it is installed, and symlinked into that plugin's `common/` folder; subsequent installs reuse the cached copy unless a newer version is available.
 
 ## For developers: releasing an update
 
