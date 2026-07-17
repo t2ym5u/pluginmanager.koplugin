@@ -429,6 +429,10 @@ function PluginManager:ensureCommon(manifest, lib_key)
         if not body then
             return false, string.format("%s/%s: %s", spec.dir, fname, err)
         end
+        local subdir = fname:match("^(.*)/[^/]+$")
+        if subdir then
+            mkdir_p(lib_dir .. "/" .. subdir)
+        end
         write_file(lib_dir .. "/" .. fname, body)
     end
     write_file(lib_dir .. "/.version", spec.version)
