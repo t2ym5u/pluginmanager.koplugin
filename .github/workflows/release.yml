@@ -48,12 +48,12 @@ jobs:
           PLUGIN="${GITHUB_REPOSITORY##*/}"
           PLUGIN_DIR="/tmp/${PLUGIN}"
           mkdir -p "${PLUGIN_DIR}/common"
-          rsync -a --exclude='.git' --exclude='.github' --exclude='common' \
+          rsync -a --exclude='.git' --exclude='.github' --exclude='common' --exclude='_game_common' \
             . "${PLUGIN_DIR}/"
           if [ -f "common/base_board.lua" ]; then
             cp common/*.lua "${PLUGIN_DIR}/common/"
           else
-            cp -r _game_common/. "${PLUGIN_DIR}/common/"
+            rsync -a --exclude='.git' _game_common/ "${PLUGIN_DIR}/common/"
           fi
           cd /tmp
           zip -r "${PLUGIN}.zip" "${PLUGIN}/"
