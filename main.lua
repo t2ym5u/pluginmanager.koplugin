@@ -221,13 +221,27 @@ local function read_meta(path)
     if not f then return nil end
     local src = f:read("*a")
     f:close()
+
+    -- Isolate a field's value to its own line before extracting the string
+    -- out of it. A previous version matched fullname's string directly
+    -- against the rest of the file with a pattern like '[^"]*"([^"]*)"' --
+    -- fine for fullname = "Plain" or fullname = _("Plain"), but for
+    -- fullname = _([[Bracket]]) (no quote anywhere near it), that pattern
+    -- skipped straight past to the next field's quotes (e.g. version =
+    -- "1.2.3") and silently captured the version string as the fullname
+    -- instead. Bounding the search to one line first makes that impossible.
+    local function field(name_pat)
+        local line = src:match(name_pat .. '%s*=%s*([^\n]+)')
+        if not line then return nil end
+        return line:match('%[%[(.-)%]%]') or line:match('"([^"]*)"')
+    end
+
     return {
         -- %f[%w] anchors to a word boundary so this doesn't match "name"
         -- inside "fullname".
-        name     = src:match('%f[%w]name%s*=%s*"([^"]+)"'),
-        fullname = src:match('fullname%s*=[^"]*"([^"]*)"')
-               or  src:match('fullname%s*=.-%[%[([^%]]-)%]%]'),
-        version  = src:match('version%s*=%s*"([^"]+)"'),
+        name     = field('%f[%w]name'),
+        fullname = field('fullname'),
+        version  = field('version'),
     }
 end
 
