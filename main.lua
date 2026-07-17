@@ -557,6 +557,35 @@ function PluginManager:_doRemove(fullname, plugin_dir)
 end
 
 -- ---------------------------------------------------------------------------
+-- Renamed-plugin cleanup
+-- ---------------------------------------------------------------------------
+
+-- When a plugin is renamed upstream (both its id and its dir change, e.g.
+-- tabou.koplugin -> taboo.koplugin), scanInstalled() keys the old install by
+-- its old id, which no longer matches anything in the manifest: installPlugin
+-- happily creates the new dir alongside it, but nothing ever removes the old
+-- one, so both show up as separate active plugins on the reader. A manifest
+-- entry can declare `renamed_from = {"old_id", ...}` to mark this; once the
+-- new plugin is confirmed present on disk under a different dir, the old
+-- directory is deleted.
+function PluginManager:_cleanupRenamed(manifest)
+    local installed = self:scanInstalled()
+    local removed = {}
+    for _, p in ipairs(manifest.plugins) do
+        if p.renamed_from and installed[p.id] then
+            for _, old_id in ipairs(p.renamed_from) do
+                local old = installed[old_id]
+                if old and old.dir ~= installed[p.id].dir then
+                    rm_rf(_plugins_dir .. "/" .. old.dir)
+                    removed[#removed + 1] = old.fullname
+                end
+            end
+        end
+    end
+    return removed
+end
+
+-- ---------------------------------------------------------------------------
 -- Per-plugin dialogs
 -- ---------------------------------------------------------------------------
 
@@ -761,6 +790,151 @@ end
 -- Full update (fetch manifest + install new + update existing)
 -- ---------------------------------------------------------------------------
 
+-- Fetches and merges every configured manifest source, and caches the
+-- result on success. On failure, shows the network-error dialog itself and
+-- returns nil -- callers can just bail out when manifest is nil.
+function PluginManager:_fetchAndMergeManifest()
+    local urls = self:getRepoURLs()
+    local results, errors = {}, {}
+    for _, url in ipairs(urls) do
+        local body, err = fetch_url(url)
+        if body then
+            local manifest = parse_json(body)
+            if manifest and manifest.plugins then
+                results[#results + 1] = { url = url, manifest = manifest }
+            else
+                errors[#errors + 1] = source_from_url(url) .. ": " .. _("invalid manifest")
+            end
+        else
+            errors[#errors + 1] = source_from_url(url) .. ": " .. (err or "?")
+        end
+    end
+    if #results == 0 then
+        UIManager:show(InfoMessage:new{
+            text    = _("Network error:") .. "\n" .. table.concat(errors, "\n"),
+            timeout = 5,
+        })
+        return nil, errors
+    end
+    local manifest = self:mergeManifests(results)
+    self._manifest = manifest
+    self:saveManifestCache(manifest)
+    return manifest, errors
+end
+
+-- Shared by doFullUpdate and doFullReinstall: refreshes every shared
+-- library referenced by `to_process` (or already installed), then installs
+-- each plugin in `to_process` one at a time with progress feedback.
+-- `opts` lets callers customise the three user-facing strings without
+-- duplicating this whole flow: nothing_to_do_text, done_text (takes one
+-- %d, the count), progress_text (same).
+function PluginManager:_runBulkInstall(manifest, errors, to_process, opts)
+    opts = opts or {}
+    local installed = self:scanInstalled()
+
+    -- Shared libraries must be refreshed independently of per-plugin
+    -- version deltas: a plugin whose own version didn't change would never
+    -- otherwise get its common/ mirror refreshed even when the shared lib
+    -- itself did. Check every common_lib used by anything installed or
+    -- about to be processed, every run.
+    local to_process_ids = {}
+    for _, p in ipairs(to_process) do to_process_ids[p.id] = true end
+    local needed_libs = {}
+    for _, p in ipairs(manifest.plugins) do
+        if p.common_lib and manifest[p.common_lib] and (installed[p.id] or to_process_ids[p.id]) then
+            needed_libs[p.common_lib] = true
+        end
+    end
+    for lib_key in pairs(needed_libs) do
+        local ok, err = safe_call(function() return self:ensureCommon(manifest, lib_key) end)
+        if not ok then
+            logger.warn("PluginManager: " .. lib_key .. " error:", err)
+            UIManager:show(InfoMessage:new{
+                text    = _("Shared library error:") .. "\n" .. (err or "?"),
+                timeout = 5,
+            })
+            return
+        end
+    end
+
+    if #to_process == 0 then
+        local removed_renamed = safe_call(function() return self:_cleanupRenamed(manifest) end) or {}
+        local parts = {}
+        if #errors > 0 then
+            parts[#parts + 1] = string.format(_("%d source(s) unavailable"), #errors)
+        end
+        parts[#parts + 1] = opts.nothing_to_do_text or _("All plugins are up to date.")
+        for _, fullname in ipairs(removed_renamed) do
+            parts[#parts + 1] = string.format(_("Removed superseded %s."), fullname)
+        end
+        UIManager:show(InfoMessage:new{
+            text    = table.concat(parts, "\n"),
+            timeout = 4,
+        })
+        return
+    end
+
+    local total    = #to_process
+    local failed   = {}
+    local has_self = false
+
+    local function finish()
+        local removed_renamed = safe_call(function() return self:_cleanupRenamed(manifest) end) or {}
+        local parts = {}
+        if #errors > 0 then
+            parts[#parts + 1] = string.format(_("%d source(s) unavailable"), #errors)
+        end
+        if #failed > 0 then
+            parts[#parts + 1] = string.format(
+                _("%d/%d done. Failures:"), total - #failed, total)
+            for _, f in ipairs(failed) do parts[#parts + 1] = f end
+        else
+            parts[#parts + 1] = string.format(opts.done_text or _("%d plugin(s) updated/installed."), total)
+        end
+        for _, fullname in ipairs(removed_renamed) do
+            parts[#parts + 1] = string.format(_("Removed superseded %s."), fullname)
+        end
+        if has_self then
+            parts[#parts + 1] = _("Please restart KOReader to apply the Plugin Manager update.")
+        end
+        UIManager:show(InfoMessage:new{
+            text    = table.concat(parts, "\n"),
+            timeout = has_self and 10 or 6,
+        })
+    end
+
+    local function step(i)
+        if i > total then finish() return end
+        local p   = to_process[i]
+        local msg = InfoMessage:new{
+            text = string.format(_("%d/%d  %s\u{2026}"), i, total, p.fullname),
+        }
+        UIManager:show(msg)
+        UIManager:scheduleIn(0.1, function()
+            UIManager:close(msg)
+            local ok, err = safe_call(function() return self:installPlugin(p, manifest) end)
+            if not ok then
+                logger.warn("PluginManager: install failed for", p.id, ":", err)
+                failed[#failed + 1] = p.fullname .. ": " .. (err or "?")
+            elseif p.id == "pluginmanager" then
+                has_self = true
+            end
+            -- Always advance, even after a failure above: one broken
+            -- plugin must not stop the rest of a bulk run.
+            step(i + 1)
+        end)
+    end
+
+    local init_msg = InfoMessage:new{
+        text = string.format(opts.progress_text or _("Updating %d plugin(s)\u{2026}"), total),
+    }
+    UIManager:show(init_msg)
+    UIManager:scheduleIn(0.2, function()
+        UIManager:close(init_msg)
+        step(1)
+    end)
+end
+
 function PluginManager:doFullUpdate()
     local ok, NetworkMgr = pcall(require, "ui/network/manager")
     if ok and NetworkMgr then
@@ -775,35 +949,11 @@ function PluginManager:_doFullUpdate()
     UIManager:show(notice)
     UIManager:scheduleIn(0.2, function()
         UIManager:close(notice)
-        local urls = self:getRepoURLs()
-        local results, errors = {}, {}
-        for _, url in ipairs(urls) do
-            local body, err = fetch_url(url)
-            if body then
-                local manifest = parse_json(body)
-                if manifest and manifest.plugins then
-                    results[#results + 1] = { url = url, manifest = manifest }
-                else
-                    errors[#errors + 1] = source_from_url(url) .. ": " .. _("invalid manifest")
-                end
-            else
-                errors[#errors + 1] = source_from_url(url) .. ": " .. (err or "?")
-            end
-        end
-        if #results == 0 then
-            UIManager:show(InfoMessage:new{
-                text    = _("Network error:") .. "\n" .. table.concat(errors, "\n"),
-                timeout = 5,
-            })
-            return
-        end
-        local manifest = self:mergeManifests(results)
-        self._manifest = manifest
-        self:saveManifestCache(manifest)
+        local manifest, errors = self:_fetchAndMergeManifest()
+        if not manifest then return end
 
         local installed  = self:scanInstalled()
         local to_process = {}
-
         for _, p in ipairs(manifest.plugins) do
             local inst = installed[p.id]
             if not inst or is_newer(inst.version, p.version) then
@@ -811,102 +961,47 @@ function PluginManager:_doFullUpdate()
             end
         end
 
-        -- Shared libraries must be refreshed independently of per-plugin
-        -- version deltas: once every consuming plugin's own version is
-        -- already current, to_process stops referencing common_lib, so a
-        -- shared-lib-only bump (or a lib a previous run failed to pick up,
-        -- e.g. mid-way through a PluginManager self-update) would otherwise
-        -- never be retried. Check every common_lib used by anything
-        -- installed or about to be installed on every run, even when no
-        -- plugin file itself needs updating.
-        local to_process_ids = {}
-        for _, p in ipairs(to_process) do to_process_ids[p.id] = true end
-        local needed_libs = {}
+        self:_runBulkInstall(manifest, errors, to_process)
+    end)
+end
+
+-- Forces a full reinstall of every currently-installed plugin, regardless
+-- of whether its own version already matches the manifest. Complements
+-- Update: a shared-lib-only fix bumps common_lib's version but not every
+-- consuming plugin's own _meta.lua version, so those plugins never appear
+-- in Update's to_process list and their common/ mirror is never refreshed by
+-- it -- Reinstall All exists as the unconditional "just fetch everything
+-- again" escape hatch for exactly that case (or any other local corruption).
+function PluginManager:doFullReinstall()
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    if ok and NetworkMgr then
+        NetworkMgr:runWhenOnline(function() self:_doFullReinstall() end)
+    else
+        self:_doFullReinstall()
+    end
+end
+
+function PluginManager:_doFullReinstall()
+    local notice = InfoMessage:new{ text = _("Fetching plugin list\u{2026}") }
+    UIManager:show(notice)
+    UIManager:scheduleIn(0.2, function()
+        UIManager:close(notice)
+        local manifest, errors = self:_fetchAndMergeManifest()
+        if not manifest then return end
+
+        local installed  = self:scanInstalled()
+        local to_process = {}
         for _, p in ipairs(manifest.plugins) do
-            if p.common_lib and manifest[p.common_lib] and (installed[p.id] or to_process_ids[p.id]) then
-                needed_libs[p.common_lib] = true
-            end
-        end
-        for lib_key in pairs(needed_libs) do
-            local ok, err = safe_call(function() return self:ensureCommon(manifest, lib_key) end)
-            if not ok then
-                logger.warn("PluginManager: " .. lib_key .. " error:", err)
-                UIManager:show(InfoMessage:new{
-                    text    = _("Shared library error:") .. "\n" .. (err or "?"),
-                    timeout = 5,
-                })
-                return
+            if installed[p.id] then
+                to_process[#to_process + 1] = p
             end
         end
 
-        if #to_process == 0 then
-            local parts = {}
-            if #errors > 0 then
-                parts[#parts + 1] = string.format(_("%d source(s) unavailable"), #errors)
-            end
-            parts[#parts + 1] = _("All plugins are up to date.")
-            UIManager:show(InfoMessage:new{
-                text    = table.concat(parts, "\n"),
-                timeout = 4,
-            })
-            return
-        end
-
-        local total    = #to_process
-        local failed   = {}
-        local has_self = false
-
-        local function finish()
-            local parts = {}
-            if #errors > 0 then
-                parts[#parts + 1] = string.format(_("%d source(s) unavailable"), #errors)
-            end
-            if #failed > 0 then
-                parts[#parts + 1] = string.format(
-                    _("%d/%d done. Failures:"), total - #failed, total)
-                for _, f in ipairs(failed) do parts[#parts + 1] = f end
-            else
-                parts[#parts + 1] = string.format(_("%d plugin(s) updated/installed."), total)
-            end
-            if has_self then
-                parts[#parts + 1] = _("Please restart KOReader to apply the Plugin Manager update.")
-            end
-            UIManager:show(InfoMessage:new{
-                text    = table.concat(parts, "\n"),
-                timeout = has_self and 10 or 6,
-            })
-        end
-
-        local function step(i)
-            if i > total then finish() return end
-            local p   = to_process[i]
-            local msg = InfoMessage:new{
-                text = string.format(_("%d/%d  %s\u{2026}"), i, total, p.fullname),
-            }
-            UIManager:show(msg)
-            UIManager:scheduleIn(0.1, function()
-                UIManager:close(msg)
-                local ok, err = safe_call(function() return self:installPlugin(p, manifest) end)
-                if not ok then
-                    logger.warn("PluginManager: update failed for", p.id, ":", err)
-                    failed[#failed + 1] = p.fullname .. ": " .. (err or "?")
-                elseif p.id == "pluginmanager" then
-                    has_self = true
-                end
-                -- Always advance, even after a failure above: one broken
-                -- plugin must not stop the rest of a bulk update.
-                step(i + 1)
-            end)
-        end
-
-        local init_msg = InfoMessage:new{
-            text = string.format(_("Updating %d plugin(s)\u{2026}"), total),
-        }
-        UIManager:show(init_msg)
-        UIManager:scheduleIn(0.2, function()
-            UIManager:close(init_msg)
-            step(1)
-        end)
+        self:_runBulkInstall(manifest, errors, to_process, {
+            nothing_to_do_text = _("No plugins installed."),
+            done_text          = _("%d plugin(s) reinstalled."),
+            progress_text      = _("Reinstalling %d plugin(s)\u{2026}"),
+        })
     end)
 end
 
@@ -924,6 +1019,17 @@ function PluginManager:showMainDialog()
                 callback = function()
                     UIManager:close(dlg)
                     self:doFullUpdate()
+                end,
+            }},
+            {{
+                text     = _("Reinstall all\u{2026}"),
+                callback = function()
+                    UIManager:close(dlg)
+                    UIManager:show(ConfirmBox:new{
+                        text        = _("Reinstall every installed plugin?\nThis re-downloads all their files, including shared libraries."),
+                        ok_text     = _("Reinstall all"),
+                        ok_callback = function() self:doFullReinstall() end,
+                    })
                 end,
             }},
             {{
