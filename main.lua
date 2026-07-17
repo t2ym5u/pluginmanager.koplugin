@@ -818,6 +818,34 @@ function PluginManager:_doFullUpdate()
             end
         end
 
+        -- Shared libraries must be refreshed independently of per-plugin
+        -- version deltas: once every consuming plugin's own version is
+        -- already current, to_process stops referencing common_lib, so a
+        -- shared-lib-only bump (or a lib a previous run failed to pick up,
+        -- e.g. mid-way through a PluginManager self-update) would otherwise
+        -- never be retried. Check every common_lib used by anything
+        -- installed or about to be installed on every run, even when no
+        -- plugin file itself needs updating.
+        local to_process_ids = {}
+        for _, p in ipairs(to_process) do to_process_ids[p.id] = true end
+        local needed_libs = {}
+        for _, p in ipairs(manifest.plugins) do
+            if p.common_lib and manifest[p.common_lib] and (installed[p.id] or to_process_ids[p.id]) then
+                needed_libs[p.common_lib] = true
+            end
+        end
+        for lib_key in pairs(needed_libs) do
+            local ok, err = safe_call(function() return self:ensureCommon(manifest, lib_key) end)
+            if not ok then
+                logger.warn("PluginManager: " .. lib_key .. " error:", err)
+                UIManager:show(InfoMessage:new{
+                    text    = _("Shared library error:") .. "\n" .. (err or "?"),
+                    timeout = 5,
+                })
+                return
+            end
+        end
+
         if #to_process == 0 then
             local parts = {}
             if #errors > 0 then
@@ -884,23 +912,6 @@ function PluginManager:_doFullUpdate()
         UIManager:show(init_msg)
         UIManager:scheduleIn(0.2, function()
             UIManager:close(init_msg)
-            local needed_libs = {}
-            for _, p in ipairs(to_process) do
-                if p.common_lib and manifest[p.common_lib] then
-                    needed_libs[p.common_lib] = true
-                end
-            end
-            for lib_key in pairs(needed_libs) do
-                local ok, err = safe_call(function() return self:ensureCommon(manifest, lib_key) end)
-                if not ok then
-                    logger.warn("PluginManager: " .. lib_key .. " error:", err)
-                    UIManager:show(InfoMessage:new{
-                        text    = _("Shared library error:") .. "\n" .. (err or "?"),
-                        timeout = 5,
-                    })
-                    return
-                end
-            end
             step(1)
         end)
     end)
