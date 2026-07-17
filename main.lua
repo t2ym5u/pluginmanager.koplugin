@@ -471,38 +471,27 @@ function PluginManager:installPlugin(plugin_info, manifest)
     end
 
     if plugin_info.common_lib then
+        -- Always copy real files into common/ on the device -- never a
+        -- symlink here. Symlinks are a local-dev-only shortcut (see the
+        -- feedback-user-local-symlinks memory); on a real reader they're
+        -- one more thing that can dangle or dead-end, and previously this
+        -- was also a one-time-only copy (skipped whenever common/ already
+        -- existed in any form), so a shared-lib fix could silently never
+        -- reach an already-installed plugin no matter how many times it
+        -- got reinstalled. Re-copying every install/update is cheap (a
+        -- handful of .lua files) and guarantees common/ is never stale.
         local spec = manifest[plugin_info.common_lib]
-        local lib_relpath = "../" .. spec.dir
         local common_path = plugin_dir .. "/common"
-        local lfs  = get_lfs()
-        local mode = lfs and lfs.attributes(common_path, "mode")
-        if mode ~= "link" and mode ~= "directory" then
-            -- Prefer lfs.link (in-process syscall) over os.execute("ln -sf"):
-            -- forking a subprocess for every single new plugin during a bulk
-            -- "Install all new" run (potentially dozens in a row, unlike
-            -- "Update all" where the symlink already exists and this branch
-            -- is skipped) can exhaust memory on e-ink hardware and crash
-            -- KOReader partway through the batch.
-            local linked = false
-            if lfs and lfs.link then
-                local ok = pcall(lfs.link, lib_relpath, common_path, true)
-                linked = ok and lfs.attributes(common_path, "mode") == "link"
-            end
-            if not linked then
-                local rc = os.execute("ln -sf " .. lib_relpath .. " " .. common_path .. " 2>/dev/null")
-                if rc ~= 0 then
-                    local lib_dir = _plugins_dir .. "/" .. spec.dir
-                    mkdir_p(common_path)
-                    if lfs and lfs.attributes(lib_dir, "mode") == "directory" then
-                        for fname in lfs.dir(lib_dir) do
-                            if fname:match("%.lua$") then
-                                local src = io.open(lib_dir .. "/" .. fname, "rb")
-                                if src then
-                                    local data = src:read("*a"); src:close()
-                                    write_file(common_path .. "/" .. fname, data)
-                                end
-                            end
-                        end
+        local lib_dir = _plugins_dir .. "/" .. spec.dir
+        local lfs = get_lfs()
+        mkdir_p(common_path)
+        if lfs and lfs.attributes(lib_dir, "mode") == "directory" then
+            for fname in lfs.dir(lib_dir) do
+                if fname:match("%.lua$") then
+                    local src = io.open(lib_dir .. "/" .. fname, "rb")
+                    if src then
+                        local data = src:read("*a"); src:close()
+                        write_file(common_path .. "/" .. fname, data)
                     end
                 end
             end
