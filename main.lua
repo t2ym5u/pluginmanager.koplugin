@@ -919,6 +919,16 @@ function PluginManager:_runBulkInstall(manifest, errors, to_process, opts)
             elseif p.id == "pluginmanager" then
                 has_self = true
             end
+            -- Each fetch accumulates response-body strings that only
+            -- become collectible once installPlugin returns; forcing a
+            -- cycle here (rather than waiting for Lua to decide it's
+            -- needed) matters on memory-constrained e-ink hardware during
+            -- a long bulk run (Reinstall All processes every installed
+            -- plugin, potentially dozens) -- letting memory pressure build
+            -- across the whole batch is exactly what previously crashed
+            -- KOReader mid-write and left a plugin's directory with only
+            -- some of its files, which then failed to load at all afterward.
+            collectgarbage("collect")
             -- Always advance, even after a failure above: one broken
             -- plugin must not stop the rest of a bulk run.
             step(i + 1)
