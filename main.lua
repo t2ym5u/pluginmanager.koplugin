@@ -684,7 +684,7 @@ end
 
 function PluginManager:showPluginList()
     local Menu   = require("ui/widget/menu")
-    local Screen = require("device/screen")
+    local Screen = require("device").screen
 
     local installed = self:scanInstalled()
     local items     = {}
