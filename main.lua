@@ -1,5 +1,14 @@
 local _dir = debug.getinfo(1, "S").source:sub(2):match("(.*[/\\])") or "./"
 local _plugins_dir = _dir:match("^(.*)/[^/]+/$") or (_dir .. "..")
+package.path = _dir .. "?.lua;" .. package.path
+
+local function lrequire(name)
+    local key = _dir .. name
+    if not package.loaded[key] then
+        package.loaded[key] = assert(loadfile(_dir .. name .. ".lua"))()
+    end
+    return package.loaded[key]
+end
 
 local ButtonDialog    = require("ui/widget/buttondialog")
 local ConfirmBox      = require("ui/widget/confirmbox")
@@ -10,7 +19,9 @@ local LuaSettings     = require("luasettings")
 local UIManager       = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger          = require("logger")
-local _               = require("gettext")
+local _               = require("i18n")
+
+require("i18n").extend(lrequire("i18n_fr"))
 
 local MANIFEST_URL   = "https://raw.githubusercontent.com/t2ym5u/koreader-plugins/master/manifest.json"
 local AUTO_CHECK_TTL = 86400  -- re-check automatically at most once every 24 h
