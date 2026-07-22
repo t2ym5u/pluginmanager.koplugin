@@ -100,22 +100,50 @@ end
 -- Network
 -- ---------------------------------------------------------------------------
 
+-- raw.githubusercontent.com rate-limits bursts of requests from the same IP
+-- with HTTP 429. A bulk update/reinstall can fire a few hundred requests
+-- (every file of every plugin, back to back) in well under a minute, which
+-- reliably tripped it and aborted the whole run. Two mitigations: pace every
+-- request a little (avoids tripping the limit in the first place) and, if a
+-- 429 slips through anyway, back off and retry rather than treating it as a
+-- hard failure.
+local FETCH_PACE_DELAY   = 0.2  -- seconds between any two requests
+local FETCH_MAX_RETRIES  = 5
+local FETCH_RETRY_DELAY  = 2    -- seconds, doubles each retry; overridden by Retry-After
+
+local function sleep(seconds)
+    local ok, socket = pcall(require, "socket")
+    if ok and socket.sleep then socket.sleep(seconds) end
+end
+
 local function fetch_url(url)
     local ok1, https = pcall(require, "ssl.https")
     if not ok1 then return nil, _("ssl.https not available") end
     local ok2, ltn12 = pcall(require, "ltn12")
     if not ok2 then return nil, _("ltn12 not available") end
-    local chunks = {}
-    local result, status = https.request{
-        url      = url,
-        sink     = ltn12.sink.table(chunks),
-        verify   = "none",
-        protocol = "tlsv1_2",
-    }
-    if result and status == 200 then
-        return table.concat(chunks)
+
+    local delay = FETCH_RETRY_DELAY
+    for attempt = 1, FETCH_MAX_RETRIES do
+        sleep(FETCH_PACE_DELAY)
+        local chunks = {}
+        local result, status, headers = https.request{
+            url      = url,
+            sink     = ltn12.sink.table(chunks),
+            verify   = "none",
+            protocol = "tlsv1_2",
+        }
+        if result and status == 200 then
+            return table.concat(chunks)
+        end
+        if status == 429 and attempt < FETCH_MAX_RETRIES then
+            local retry_after = headers and tonumber(headers["retry-after"])
+            sleep(retry_after or delay)
+            delay = delay * 2
+        else
+            return nil, string.format(_("HTTP %s"), tostring(status or "?"))
+        end
     end
-    return nil, string.format(_("HTTP %s"), tostring(status or "?"))
+    return nil, string.format(_("HTTP %s"), tostring(429))
 end
 
 -- ---------------------------------------------------------------------------
