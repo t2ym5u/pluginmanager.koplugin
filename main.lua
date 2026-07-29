@@ -276,9 +276,6 @@ local function read_meta(path)
     end
 
     return {
-        -- %f[%w] anchors to a word boundary so this doesn't match "name"
-        -- inside "fullname".
-        name     = field('%f[%w]name'),
         fullname = field('fullname'),
         version  = field('version'),
     }
@@ -294,12 +291,17 @@ function PluginManager:scanInstalled()
     local installed = {}
     local ok = pcall(function()
         for entry in lfs.dir(_plugins_dir) do
-            if entry:match("%.koplugin$") then
+            -- KOReader's own PluginLoader derives a plugin's id from its
+            -- directory name (stripping ".koplugin") and ignores/warns on
+            -- any "name" field in _meta.lua -- match that here instead of
+            -- trusting _meta.lua's own (now-removed) name field.
+            local id = entry:match("^(.*)%.koplugin$")
+            if id then
                 local meta = read_meta(_plugins_dir .. "/" .. entry .. "/_meta.lua")
-                if meta and meta.name then
-                    installed[meta.name] = {
+                if meta then
+                    installed[id] = {
                         version  = meta.version or "?",
-                        fullname = meta.fullname or meta.name,
+                        fullname = meta.fullname or id,
                         dir      = entry,
                     }
                 end
