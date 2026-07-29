@@ -57,4 +57,10 @@ return {
     ["Reinstall all"]            = { fr = "Tout réinstaller" },
     ["Plugin list"]              = { fr = "Liste des plugins" },
     ["Manage sources\u{2026}"]   = { fr = "Gérer les sources…" },
+
+    ["Remove all\u{2026}"]       = { fr = "Tout supprimer…" },
+    ["Remove every installed plugin?\nAll their files will be deleted. Plugin Manager itself is kept so you can reinstall afterwards."] = { fr = "Supprimer tous les plugins installés ?\nTous leurs fichiers seront supprimés. Le Gestionnaire de plugins lui-même est conservé pour pouvoir tout réinstaller ensuite." },
+    ["Remove all"]               = { fr = "Tout supprimer" },
+    ["No plugins to remove."]    = { fr = "Aucun plugin à supprimer." },
+    ["%d plugin(s) removed."]    = { fr = "%d plugin(s) supprimé(s)." },
 }
