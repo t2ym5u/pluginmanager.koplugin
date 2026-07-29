@@ -1046,6 +1046,42 @@ function PluginManager:doFullReinstall()
     end
 end
 
+-- Removes every installed plugin except Plugin Manager itself (deleting its
+-- own directory mid-run would leave no way to reinstall anything afterwards).
+function PluginManager:doRemoveAll()
+    local installed = self:scanInstalled()
+    local to_remove = {}
+    for id, inst in pairs(installed) do
+        if id ~= "pluginmanager" then
+            to_remove[#to_remove + 1] = inst
+        end
+    end
+    table.sort(to_remove, function(a, b) return a.fullname < b.fullname end)
+
+    if #to_remove == 0 then
+        UIManager:show(InfoMessage:new{
+            text    = _("No plugins to remove."),
+            timeout = 3,
+        })
+        return
+    end
+
+    local total = #to_remove
+    local function step(i)
+        if i > total then
+            UIManager:show(InfoMessage:new{
+                text    = string.format(_("%d plugin(s) removed."), total),
+                timeout = 5,
+            })
+            return
+        end
+        local inst = to_remove[i]
+        rm_rf(_plugins_dir .. "/" .. inst.dir)
+        UIManager:scheduleIn(0, function() step(i + 1) end)
+    end
+    step(1)
+end
+
 function PluginManager:_doFullReinstall()
     local notice = InfoMessage:new{ text = _("Fetching plugin list\u{2026}") }
     UIManager:show(notice)
@@ -1094,6 +1130,17 @@ function PluginManager:showMainDialog()
                         text        = _("Reinstall every installed plugin?\nThis re-downloads all their files, including shared libraries."),
                         ok_text     = _("Reinstall all"),
                         ok_callback = function() self:doFullReinstall() end,
+                    })
+                end,
+            }},
+            {{
+                text     = _("Remove all\u{2026}"),
+                callback = function()
+                    UIManager:close(dlg)
+                    UIManager:show(ConfirmBox:new{
+                        text        = _("Remove every installed plugin?\nAll their files will be deleted. Plugin Manager itself is kept so you can reinstall afterwards."),
+                        ok_text     = _("Remove all"),
+                        ok_callback = function() self:doRemoveAll() end,
                     })
                 end,
             }},
