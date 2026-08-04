@@ -671,7 +671,7 @@ function PluginManager:showIgnoredDialog()
     if #ids == 0 then
         buttons[#buttons + 1] = {{ text = _("No ignored updates."), enabled = false }}
     else
-        for _, id in ipairs(ids) do
+        for _i, id in ipairs(ids) do
             local pid = id
             buttons[#buttons + 1] = {
                 { text = pid .. "  v" .. ignored[id], enabled = false },
@@ -1310,7 +1310,7 @@ function PluginManager:_showDiscoverDialog(page, accumulated, link_target)
                     callback = function() self:confirmInstallAll(accumulated) end,
                 }
             end
-            for _, repo in ipairs(accumulated) do
+            for _i, repo in ipairs(accumulated) do
                 local pref = repo
                 local status, bold
                 if repo._installed then
@@ -2003,7 +2003,7 @@ function PluginManager:showPluginList()
 
     if not self._manifest then
         -- Offline: show only locally-installed plugins
-        for _, inst in pairs(installed) do
+        for _i, inst in pairs(installed) do
             local iref = inst
             items[#items + 1] = {
                 text        = (iref.disabled and (_("[DISABLED]") .. " ") or "") .. iref.fullname,
@@ -2021,7 +2021,7 @@ function PluginManager:showPluginList()
         end
     else
         local known_ids = {}
-        for _, p in ipairs(self._manifest.plugins) do
+        for _i, p in ipairs(self._manifest.plugins) do
             known_ids[p.id] = true
             local inst = installed[p.id]
             if inst then
@@ -2184,7 +2184,7 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
         local removed_renamed = safe_call(function() return self:_cleanupRenamed(manifest) end) or {}
         local parts = {}
         parts[#parts + 1] = opts.nothing_to_do_text or _("All plugins are up to date.")
-        for _, fullname in ipairs(removed_renamed) do
+        for _i, fullname in ipairs(removed_renamed) do
             parts[#parts + 1] = string.format(_("Removed superseded %s."), fullname)
         end
         UIManager:show(InfoMessage:new{
@@ -2208,7 +2208,7 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
         else
             parts[#parts + 1] = string.format(opts.done_text or _("%d plugin(s) updated/installed."), total)
         end
-        for _, fullname in ipairs(removed_renamed) do
+        for _i, fullname in ipairs(removed_renamed) do
             parts[#parts + 1] = string.format(_("Removed superseded %s."), fullname)
         end
         if has_self then
