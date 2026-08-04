@@ -1124,6 +1124,13 @@ end
 function PluginManager:showDiscoveredRepoDialog(repo)
     local dlg
     local title = repo.full_name .. string.format("  \u{2605}%d", repo.stars)
+    if repo._installed then
+        if repo._remote_version and is_newer(repo._installed.version, repo._remote_version) then
+            title = title .. "\n" .. string.format(_("Installed v%s \u{2014} update to v%s available"), repo._installed.version, repo._remote_version)
+        else
+            title = title .. "\n" .. string.format(_("Already installed (v%s)"), repo._installed.version)
+        end
+    end
     if repo.description and repo.description ~= "" then
         title = title .. "\n" .. repo.description
     end
@@ -1269,66 +1276,125 @@ function PluginManager:_showDiscoverDialog(page, accumulated, link_target)
 
         local Menu   = require("ui/widget/menu")
         local Screen = require("device").screen
-        local items  = {}
-        if not link_target and #accumulated >= 2 then
-            items[#items + 1] = {
-                text     = string.format(_("Install all %d shown\u{2026}"), #accumulated),
-                bold     = true,
-                callback = function() self:confirmInstallAll(accumulated) end,
-            }
-        end
-        for _, repo in ipairs(accumulated) do
-            local pref = repo
-            items[#items + 1] = {
-                text      = repo.full_name,
-                mandatory = string.format("\u{2605}%d", repo.stars),
-                callback  = function()
-                    if link_target then
-                        self:confirmLinkRepo(link_target, pref)
-                    else
-                        self:showDiscoveredRepoDialog(pref)
+
+        -- Cross-reference each result against what's on disk under the
+        -- folder name a plain single-repo install would use (same fallback
+        -- detect_plugin_layout uses), so already-installed repos are marked
+        -- in the list instead of only surfacing a warning at Install time.
+        -- Cached on the repo table itself so paging in more results or
+        -- re-sorting doesn't re-fetch remote versions already checked.
+        -- Skipped in link_target mode: that flow picks a repo to *link* an
+        -- existing untracked install to, so "already installed" isn't a
+        -- meaningful signal there.
+        local to_check = {}
+        if not link_target then
+            local scanned = self:scanInstalled()
+            for _, repo in ipairs(accumulated) do
+                if repo._installed == nil then
+                    local dirname = repo.name:match("%.koplugin$") and repo.name or (repo.name .. ".koplugin")
+                    local id = dirname:match("^(.*)%.koplugin$")
+                    repo._installed = scanned[id] or false
+                    if repo._installed and repo._update_checked == nil then
+                        to_check[#to_check + 1] = repo
                     end
-                end,
-            }
-        end
-        if not owner_query and has_more then
-            -- At least one of the two merged queries had a full page: there
-            -- may well be more.
-            items[#items + 1] = {
-                text     = _("Load more\u{2026}"),
-                callback = function() self:_showDiscoverDialog(page + 1, accumulated, link_target) end,
-            }
+                end
+            end
         end
 
-        local menu_instance
-        menu_instance = Menu:new{
-            title               = link_target
-                and string.format(_("Select repo for %s"), link_target.fullname)
-                or  _("Discover plugins"),
-            subtitle            = self._discover_filter and string.format(_("Search: %s"), self._discover_filter) or nil,
-            item_table          = items,
-            width               = Screen:getWidth(),
-            height              = Screen:getHeight(),
-            title_bar_left_icon = "appbar.search",
-            onLeftButtonTap     = function()
-                UIManager:close(menu_instance)
-                self:showDiscoverFilterDialog(link_target)
-            end,
-            onLeftButtonHold    = function()
-                local mode = self:cycleDiscoverSort()
-                UIManager:close(menu_instance)
-                UIManager:show(InfoMessage:new{
-                    text    = mode == "updated" and _("Sorted by last updated.") or _("Sorted by stars."),
-                    timeout = 2,
-                })
-                self:showDiscoverDialog(link_target)
-            end,
-        }
-        function menu_instance:onMenuChoice(item)
-            UIManager:close(self)
-            if item.callback then item.callback() end
+        local function build_menu()
+            local items = {}
+            if not link_target and #accumulated >= 2 then
+                items[#items + 1] = {
+                    text     = string.format(_("Install all %d shown\u{2026}"), #accumulated),
+                    bold     = true,
+                    callback = function() self:confirmInstallAll(accumulated) end,
+                }
+            end
+            for _, repo in ipairs(accumulated) do
+                local pref = repo
+                local status, bold
+                if repo._installed then
+                    if repo._remote_version and is_newer(repo._installed.version, repo._remote_version) then
+                        status = string.format(_("v%s\u{2192}v%s"), repo._installed.version, repo._remote_version)
+                        bold   = true
+                    else
+                        status = string.format(_("Installed v%s"), repo._installed.version)
+                    end
+                end
+                items[#items + 1] = {
+                    text      = repo.full_name,
+                    mandatory = status
+                        and string.format("%s  \u{2605}%d", status, repo.stars)
+                        or  string.format("\u{2605}%d", repo.stars),
+                    bold      = bold,
+                    callback  = function()
+                        if link_target then
+                            self:confirmLinkRepo(link_target, pref)
+                        else
+                            self:showDiscoveredRepoDialog(pref)
+                        end
+                    end,
+                }
+            end
+            if not owner_query and has_more then
+                -- At least one of the two merged queries had a full page: there
+                -- may well be more.
+                items[#items + 1] = {
+                    text     = _("Load more\u{2026}"),
+                    callback = function() self:_showDiscoverDialog(page + 1, accumulated, link_target) end,
+                }
+            end
+
+            local menu_instance
+            menu_instance = Menu:new{
+                title               = link_target
+                    and string.format(_("Select repo for %s"), link_target.fullname)
+                    or  _("Discover plugins"),
+                subtitle            = self._discover_filter and string.format(_("Search: %s"), self._discover_filter) or nil,
+                item_table          = items,
+                width               = Screen:getWidth(),
+                height              = Screen:getHeight(),
+                title_bar_left_icon = "appbar.search",
+                onLeftButtonTap     = function()
+                    UIManager:close(menu_instance)
+                    self:showDiscoverFilterDialog(link_target)
+                end,
+                onLeftButtonHold    = function()
+                    local mode = self:cycleDiscoverSort()
+                    UIManager:close(menu_instance)
+                    UIManager:show(InfoMessage:new{
+                        text    = mode == "updated" and _("Sorted by last updated.") or _("Sorted by stars."),
+                        timeout = 2,
+                    })
+                    self:showDiscoverDialog(link_target)
+                end,
+            }
+            function menu_instance:onMenuChoice(item)
+                UIManager:close(self)
+                if item.callback then item.callback() end
+            end
+            UIManager:show(menu_instance)
         end
-        UIManager:show(menu_instance)
+
+        if #to_check == 0 then
+            build_menu()
+        else
+            local check_notice = InfoMessage:new{ text = _("Checking installed plugins for updates\u{2026}") }
+            UIManager:show(check_notice)
+            local function check_step(i)
+                if i > #to_check then
+                    UIManager:close(check_notice)
+                    build_menu()
+                    return
+                end
+                local repo = to_check[i]
+                local body = fetch_url(github_raw_base_url(repo.owner, repo.name) .. "_meta.lua")
+                repo._remote_version = body and parse_meta(body).version or nil
+                repo._update_checked = true
+                UIManager:scheduleIn(0, function() check_step(i + 1) end)
+            end
+            check_step(1)
+        end
     end)
 end
 

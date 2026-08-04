@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.2] - 2026-08-04
+
+### Added
+- Discover plugins: results already installed locally are now marked
+  (`Installed vX`), and are checked against their remote `_meta.lua` for a
+  newer version (`vX→vY`, shown in bold), the same way the main installed
+  list already flags updates. Only fires for results actually already
+  installed, and via raw.githubusercontent.com (already paced/retried),
+  not api.github.com — doesn't touch the search/install rate limit.
+
 ## [1.2.1] - 2026-08-04
 
 ### Fixed
