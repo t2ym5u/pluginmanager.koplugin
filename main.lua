@@ -137,6 +137,26 @@ function PluginManager:forgetDiscoverInstall(id)
     if all[id] == nil then return end
     all[id] = nil
     self.settings:saveSetting("discover_installs", all)
+    self:setDiscoverUpdateCache(id, nil)
+    self.settings:flush()
+end
+
+-- Last remote version seen for a Discover-linked plugin, refreshed by
+-- _refreshDiscoverLinkedVersions (piggybacked on the "Update" button) so
+-- showPluginList can flag an available update for it without a network call
+-- on every list open, the same way the manifest section's badge is driven
+-- by the already-cached manifest rather than a live check per open.
+function PluginManager:getDiscoverUpdateCache(id)
+    self:ensureSettings()
+    local all = self.settings:readSetting("discover_update_cache") or {}
+    return all[id]
+end
+
+function PluginManager:setDiscoverUpdateCache(id, version)
+    self:ensureSettings()
+    local all = self.settings:readSetting("discover_update_cache") or {}
+    all[id] = version
+    self.settings:saveSetting("discover_update_cache", all)
     self.settings:flush()
 end
 
@@ -2053,12 +2073,21 @@ function PluginManager:showPluginList()
         -- Locally installed but absent from manifest
         for id, inst in pairs(installed) do
             if not known_ids[id] then
-                local iref = inst
-                local tag  = self:getDiscoverInstall(id) and _("(GitHub)") or _("(local)")
+                local iref          = inst
+                local repo          = self:getDiscoverInstall(id)
+                local tag           = repo and _("(GitHub)") or _("(local)")
+                local remote_version = repo and self:getDiscoverUpdateCache(id)
+                local has_update    = remote_version
+                    and is_newer(inst.version, remote_version)
+                    and not self:isVersionIgnored(id, remote_version)
+                local detail = has_update
+                    and ("v" .. inst.version .. " \u{2192} v" .. remote_version .. " " .. tag)
+                    or  ("v" .. inst.version .. " " .. tag)
                 items[#items + 1] = {
                     text        = (inst.disabled and (_("[DISABLED]") .. " ") or "") .. inst.fullname,
-                    mandatory   = "v" .. inst.version .. " " .. tag,
-                    _sort_group = SORT_GROUP_LOCAL_ONLY,
+                    mandatory   = detail,
+                    bold        = has_update,
+                    _sort_group = has_update and SORT_GROUP_UPDATE or SORT_GROUP_LOCAL_ONLY,
                     callback    = function() self:showLocalOnlyDialog(iref) end,
                 }
             end
@@ -2271,6 +2300,41 @@ function PluginManager:doFullUpdate()
     end
 end
 
+-- Refreshes the cached remote version of every Discover-linked plugin
+-- that's still actually installed, piggybacked on the "Update" button
+-- (already a network-required action the user takes periodically) so
+-- showPluginList's "(GitHub)" section can show an update badge without
+-- needing its own network call every time the list is opened. No failure
+-- surfaced per item -- a plugin whose fetch fails just keeps its last known
+-- cached version (or none) until the next Update.
+function PluginManager:_refreshDiscoverLinkedVersions(installed, on_done)
+    self:ensureSettings()
+    local links = self.settings:readSetting("discover_installs") or {}
+    local to_check = {}
+    for id, repo in pairs(links) do
+        if installed[id] then to_check[#to_check + 1] = { id = id, repo = repo } end
+    end
+    if #to_check == 0 then
+        on_done()
+        return
+    end
+    local notice = InfoMessage:new{ text = _("Checking linked plugins for updates\u{2026}") }
+    UIManager:show(notice)
+    local function step(i)
+        if i > #to_check then
+            UIManager:close(notice)
+            on_done()
+            return
+        end
+        local entry   = to_check[i]
+        local body    = fetch_url(github_raw_base_url(entry.repo.owner, entry.repo.name) .. "_meta.lua")
+        local version = body and parse_meta(body).version
+        if version then self:setDiscoverUpdateCache(entry.id, version) end
+        UIManager:scheduleIn(0, function() step(i + 1) end)
+    end
+    step(1)
+end
+
 function PluginManager:_doFullUpdate()
     local notice = InfoMessage:new{ text = _("Fetching plugin list\u{2026}") }
     UIManager:show(notice)
@@ -2288,7 +2352,9 @@ function PluginManager:_doFullUpdate()
             end
         end
 
-        self:_runBulkInstall(manifest, to_process)
+        self:_refreshDiscoverLinkedVersions(installed, function()
+            self:_runBulkInstall(manifest, to_process)
+        end)
     end)
 end
 

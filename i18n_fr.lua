@@ -167,4 +167,12 @@ return {
     ["Overwrite"]                    = { fr = "Écraser" },
     ["Cancelled: a different plugin already occupies this folder."]
         = { fr = "Annulé : un autre plugin occupe déjà ce dossier." },
+
+    ["Installed v%s"]                = { fr = "Installé v%s" },
+    ["v%s\u{2192}v%s"]               = { fr = "v%s\u{2192}v%s" },
+    ["Already installed (v%s)"]      = { fr = "Déjà installé (v%s)" },
+    ["Installed v%s \u{2014} update to v%s available"]
+        = { fr = "Installé v%s — mise à jour v%s disponible" },
+    ["Checking installed plugins for updates\u{2026}"] = { fr = "Vérification des mises à jour des plugins installés…" },
+    ["Checking linked plugins for updates\u{2026}"]    = { fr = "Vérification des mises à jour des plugins liés…" },
 }
