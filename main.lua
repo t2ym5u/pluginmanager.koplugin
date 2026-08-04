@@ -2242,40 +2242,67 @@ function PluginManager:doFullReinstall()
     end
 end
 
--- Removes every installed plugin except Plugin Manager itself (deleting its
--- own directory mid-run would leave no way to reinstall anything afterwards).
 function PluginManager:doRemoveAll()
-    local installed = self:scanInstalled()
-    local to_remove = {}
-    for id, inst in pairs(installed) do
-        if id ~= "pluginmanager" then
-            to_remove[#to_remove + 1] = inst
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    if ok and NetworkMgr then
+        NetworkMgr:runWhenOnline(function() self:_doRemoveAll() end)
+    else
+        self:_doRemoveAll()
+    end
+end
+
+-- Removes every installed plugin *that Plugin Manager itself manages*,
+-- except Plugin Manager (deleting its own directory mid-run would leave no
+-- way to reinstall anything afterwards). scanInstalled() picks up any
+-- "*.koplugin" directory with a _meta.lua -- which includes KOReader's own
+-- built-in plugins and unrelated third-party plugins, not just ones this
+-- fleet's manifest installed. The manifest is the only reliable membership
+-- check, so it's fetched live (like doFullUpdate/doFullReinstall) rather
+-- than trusting scanInstalled() alone, to avoid deleting plugins Plugin
+-- Manager never put there.
+function PluginManager:_doRemoveAll()
+    local notice = InfoMessage:new{ text = _("Fetching plugin list\u{2026}") }
+    UIManager:show(notice)
+    UIManager:scheduleIn(0.2, function()
+        UIManager:close(notice)
+        local manifest = self:_fetchManifest()
+        if not manifest then return end
+
+        local managed_ids = {}
+        for _, p in ipairs(manifest.plugins) do managed_ids[p.id] = true end
+
+        local installed = self:scanInstalled()
+        local to_remove = {}
+        for id, inst in pairs(installed) do
+            if id ~= "pluginmanager" and managed_ids[id] then
+                to_remove[#to_remove + 1] = inst
+            end
         end
-    end
-    table.sort(to_remove, function(a, b) return a.fullname < b.fullname end)
+        table.sort(to_remove, function(a, b) return a.fullname < b.fullname end)
 
-    if #to_remove == 0 then
-        UIManager:show(InfoMessage:new{
-            text    = _("No plugins to remove."),
-            timeout = 3,
-        })
-        return
-    end
-
-    local total = #to_remove
-    local function step(i)
-        if i > total then
+        if #to_remove == 0 then
             UIManager:show(InfoMessage:new{
-                text    = string.format(_("%d plugin(s) removed."), total),
-                timeout = 5,
+                text    = _("No plugins to remove."),
+                timeout = 3,
             })
             return
         end
-        local inst = to_remove[i]
-        rm_rf(_plugins_dir .. "/" .. inst.dir)
-        UIManager:scheduleIn(0, function() step(i + 1) end)
-    end
-    step(1)
+
+        local total = #to_remove
+        local function step(i)
+            if i > total then
+                UIManager:show(InfoMessage:new{
+                    text    = string.format(_("%d plugin(s) removed."), total),
+                    timeout = 5,
+                })
+                return
+            end
+            local inst = to_remove[i]
+            rm_rf(_plugins_dir .. "/" .. inst.dir)
+            UIManager:scheduleIn(0, function() step(i + 1) end)
+        end
+        step(1)
+    end)
 end
 
 function PluginManager:_doFullReinstall()
@@ -2351,7 +2378,7 @@ function PluginManager:showMainDialog()
                 callback = function()
                     UIManager:close(dlg)
                     UIManager:show(ConfirmBox:new{
-                        text        = _("Remove every installed plugin?\nAll their files will be deleted. Plugin Manager itself is kept so you can reinstall afterwards."),
+                        text        = _("Remove every plugin managed by Plugin Manager?\nAll their files will be deleted. Plugin Manager itself and any other plugin on your device (including KOReader's own) are left untouched."),
                         ok_text     = _("Remove all"),
                         ok_callback = function() self:doRemoveAll() end,
                     })

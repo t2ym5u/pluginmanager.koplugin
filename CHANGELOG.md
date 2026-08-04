@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.1] - 2026-08-04
+
+### Fixed
+- "Remove all…" deleted every `*.koplugin` directory it found with a
+  `_meta.lua`, including KOReader's own built-in plugins, not just the ones
+  this fleet's manifest installed. It now fetches the manifest and only
+  removes plugins actually listed in it, like Update/Reinstall all already
+  do.
+
 ## [1.2.0] - 2026-08-04
 
 ### Added

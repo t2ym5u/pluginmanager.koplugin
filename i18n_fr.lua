@@ -50,7 +50,7 @@ return {
     ["Plugin list"]              = { fr = "Liste des plugins" },
 
     ["Remove all\u{2026}"]       = { fr = "Tout supprimer…" },
-    ["Remove every installed plugin?\nAll their files will be deleted. Plugin Manager itself is kept so you can reinstall afterwards."] = { fr = "Supprimer tous les plugins installés ?\nTous leurs fichiers seront supprimés. Le Gestionnaire de plugins lui-même est conservé pour pouvoir tout réinstaller ensuite." },
+    ["Remove every plugin managed by Plugin Manager?\nAll their files will be deleted. Plugin Manager itself and any other plugin on your device (including KOReader's own) are left untouched."] = { fr = "Supprimer tous les plugins gérés par le Gestionnaire de plugins ?\nTous leurs fichiers seront supprimés. Le Gestionnaire de plugins lui-même et tout autre plugin de votre liseuse (y compris ceux de KOReader) ne seront pas touchés." },
     ["Remove all"]               = { fr = "Tout supprimer" },
     ["No plugins to remove."]    = { fr = "Aucun plugin à supprimer." },
     ["%d plugin(s) removed."]    = { fr = "%d plugin(s) supprimé(s)." },
