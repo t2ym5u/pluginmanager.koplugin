@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.4] - 2026-08-04
+
+### Added
+- Plugin list: a plugin installed via Discover-link (tagged `(GitHub)`) now
+  shows an update badge (`vX→vY`, bold, sorted to the top) the same way
+  manifest-tracked plugins already do. Its remote version is refreshed
+  quietly when pressing "Update" (already a network action taken
+  periodically), then cached, so opening the plugin list itself stays
+  instant and works offline — no per-open network call.
+
+## [1.2.3] - 2026-08-04
+
+### Fixed
+- Six loops used `_` as their discard variable, shadowing the module-level
+  gettext alias (`local _ = require("i18n")`). Any `_(...)` call inside
+  those loop bodies then tried to call the loop's numeric index/key instead
+  of the translation function, crashing with "attempt to call local '_' (a
+  number value)" in showIgnoredDialog, the Discover results list,
+  showPluginList, and both removed/renamed-plugin summaries in
+  `_runBulkInstall`.
+
 ## [1.2.2] - 2026-08-04
 
 ### Added
