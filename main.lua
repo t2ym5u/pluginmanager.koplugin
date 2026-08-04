@@ -26,14 +26,6 @@ require("i18n").extend(lrequire("i18n_fr"))
 local MANIFEST_URL   = "https://raw.githubusercontent.com/t2ym5u/koreader-plugins/master/manifest.json"
 local AUTO_CHECK_TTL = 86400  -- re-check automatically at most once every 24 h
 
--- Shared-library keys: manifest.json top-level sections describing a
--- downloadable common/ bundle, one per shared-code family (see the
--- project-sudoku-common-architecture memory — game-common's ScreenBase and
--- sudoku-common's BaseScreen are NOT interchangeable). Each plugin_info
--- names the one it needs via plugin_info.common_lib, e.g. "common" or
--- "sudoku_common", which indexes straight into this list / into manifest.
-local COMMON_LIB_KEYS = { "common", "sudoku_common" }
-
 -- Runs fn(...) shielded from Lua errors (a bad manifest entry, an
 -- unexpected nil, a third-party source with malformed data...). Any escape
 -- is logged to crash.log and turned into a normal (false, message) result,
@@ -47,10 +39,28 @@ local function safe_call(fn, ...)
     return a, b
 end
 
-local function source_from_url(url)
-    local user = url:match("raw%.githubusercontent%.com/([^/]+)/")
-    if user then return user end
-    return url:match("https?://([^/]+)/") or url
+-- ---------------------------------------------------------------------------
+-- Disable / enable installed plugins without deleting them
+-- ---------------------------------------------------------------------------
+
+-- Same mechanism KOReader's own plugin management screen and other plugin
+-- managers (e.g. appstore.koplugin) use: a plugin id -> true map in the
+-- global reader settings. PluginLoader consults this at startup to decide
+-- which plugins to actually load, so toggling it only takes effect after a
+-- restart -- there is no live enable/disable of an already-loaded plugin.
+local function is_plugin_disabled(id)
+    local disabled = G_reader_settings:readSetting("plugins_disabled") or {}
+    return disabled[id] == true
+end
+
+local function set_plugin_disabled(id, disabled)
+    local list = G_reader_settings:readSetting("plugins_disabled") or {}
+    if disabled then
+        list[id] = true
+    else
+        list[id] = nil
+    end
+    G_reader_settings:saveSetting("plugins_disabled", list)
 end
 
 -- ---------------------------------------------------------------------------
@@ -72,6 +82,62 @@ function PluginManager:ensureSettings()
             DataStorage:getSettingsDir() .. "/pluginmanager.lua"
         )
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- Ignored updates
+-- ---------------------------------------------------------------------------
+
+-- A plugin id can have at most one ignored version at a time: the one the
+-- user last chose to skip. If the manifest later advances past it, is_newer()
+-- against the *new* manifest version stops matching this stale entry on its
+-- own, so the update reappears without needing any active cleanup.
+function PluginManager:isVersionIgnored(id, version)
+    self:ensureSettings()
+    local ignored = self.settings:readSetting("ignored_versions") or {}
+    return ignored[id] == version
+end
+
+function PluginManager:setIgnoredVersion(id, version)
+    self:ensureSettings()
+    local ignored = self.settings:readSetting("ignored_versions") or {}
+    ignored[id] = version
+    self.settings:saveSetting("ignored_versions", ignored)
+    self.settings:flush()
+end
+
+-- ---------------------------------------------------------------------------
+-- Discover installs (plugin id -> source GitHub repo)
+-- ---------------------------------------------------------------------------
+
+-- manifest.json plugins carry their own raw_base_url, so the repo link is
+-- already right there in the data pluginmanager already caches. A plugin
+-- installed via "Discover plugins…" has no manifest entry at all, so
+-- without this it would become indistinguishable from any other
+-- third-party-installed plugin the moment it lands in plugins/ -- no way to
+-- check it for updates ever again. This is the minimal fix: remember which
+-- repo it came from, keyed by the same id scanInstalled() already uses.
+function PluginManager:getDiscoverInstall(id)
+    self:ensureSettings()
+    local all = self.settings:readSetting("discover_installs") or {}
+    return all[id]
+end
+
+function PluginManager:recordDiscoverInstall(id, repo)
+    self:ensureSettings()
+    local all = self.settings:readSetting("discover_installs") or {}
+    all[id] = { owner = repo.owner, name = repo.name, full_name = repo.full_name }
+    self.settings:saveSetting("discover_installs", all)
+    self.settings:flush()
+end
+
+function PluginManager:forgetDiscoverInstall(id)
+    self:ensureSettings()
+    local all = self.settings:readSetting("discover_installs") or {}
+    if all[id] == nil then return end
+    all[id] = nil
+    self.settings:saveSetting("discover_installs", all)
+    self.settings:flush()
 end
 
 function PluginManager:saveManifestCache(manifest)
@@ -144,6 +210,246 @@ local function fetch_url(url)
         end
     end
     return nil, string.format(_("HTTP %s"), tostring(429))
+end
+
+-- Streams a response straight to a file instead of building it up as one Lua
+-- string in memory -- used for zip downloads, which can run to a few
+-- hundred KB and would otherwise sit fully in RAM twice (once as the ltn12
+-- chunk table, once as table.concat's result) on memory-constrained e-ink
+-- hardware. ltn12.sink.file closes the handle itself once done, on both
+-- success and failure.
+local function fetch_to_file(url, path, extra_headers)
+    local ok1, https = pcall(require, "ssl.https")
+    if not ok1 then return false, _("ssl.https not available") end
+    local ok2, ltn12 = pcall(require, "ltn12")
+    if not ok2 then return false, _("ltn12 not available") end
+    local file, ferr = io.open(path, "wb")
+    if not file then return false, ferr end
+
+    local headers = { ["User-Agent"] = "pluginmanager.koplugin" }
+    for k, v in pairs(extra_headers or {}) do headers[k] = v end
+
+    local result, status = https.request{
+        url      = url,
+        sink     = ltn12.sink.file(file),
+        headers  = headers,
+        verify   = "none",
+        protocol = "tlsv1_2",
+    }
+    if result and status == 200 then return true end
+    os.remove(path)
+    return false, string.format(_("HTTP %s"), tostring(status or "?"))
+end
+
+-- ---------------------------------------------------------------------------
+-- GitHub API (repository discovery)
+-- ---------------------------------------------------------------------------
+
+-- Optional local config file (never committed -- see .gitignore) letting a
+-- user supply a classic GitHub PAT to raise the search API's very low
+-- unauthenticated rate limit (10 requests/minute). Mirrors the same pattern
+-- appstore.koplugin uses, so anyone already familiar with that plugin's
+-- config file recognises this one.
+local function github_config()
+    local ok, cfg = pcall(require, "pluginmanager_configuration")
+    return ok and cfg or {}
+end
+
+local function github_headers()
+    local headers = {
+        ["User-Agent"] = "pluginmanager.koplugin",
+        ["Accept"]     = "application/vnd.github+json",
+    }
+    local token = github_config().github_token
+    if token and token ~= "" and token ~= "ghp_your_token_here" then
+        headers["Authorization"] = "token " .. token
+    end
+    return headers
+end
+
+-- GET path (e.g. "/search/repositories") against api.github.com with query
+-- already URL-encoded by the caller. Returns (parsed_json, nil) on success or
+-- (nil, message) on failure -- a 403/429 is reported distinctly since it
+-- almost always means the (usually unauthenticated) rate limit was hit.
+local function github_api_get(path, query)
+    local ok1, https = pcall(require, "ssl.https")
+    if not ok1 then return nil, _("ssl.https not available") end
+    local ok2, ltn12 = pcall(require, "ltn12")
+    if not ok2 then return nil, _("ltn12 not available") end
+
+    local url = "https://api.github.com" .. path
+    if query and query ~= "" then url = url .. "?" .. query end
+
+    local chunks = {}
+    local result, status = https.request{
+        url      = url,
+        sink     = ltn12.sink.table(chunks),
+        headers  = github_headers(),
+        verify   = "none",
+        protocol = "tlsv1_2",
+    }
+    local body = table.concat(chunks)
+    if not result or status ~= 200 then
+        if status == 403 or status == 429 then
+            return nil, _("GitHub API rate limit reached. Try again later, or set a GitHub token in pluginmanager_configuration.lua.")
+        end
+        return nil, string.format(_("HTTP %s"), tostring(status or "?"))
+    end
+    local data, jerr = parse_json(body)
+    if not data then return nil, jerr end
+    return data
+end
+
+local function url_encode(s)
+    local ok, url = pcall(require, "socket.url")
+    if ok and url.escape then return url.escape(s) end
+    return (s:gsub("[^%w%-%.%_%~]", function(c)
+        return string.format("%%%02X", c:byte())
+    end))
+end
+
+local function github_raw_base_url(owner, name)
+    return string.format("https://raw.githubusercontent.com/%s/%s/HEAD/", owner, name)
+end
+
+-- GitHub's topic tagging is self-reported and not curated: `topic:koreader-plugin`
+-- reliably includes some completely unrelated repos that happen to carry the
+-- tag (e.g. an ebook reader app whose maintainer tagged it once, with no
+-- other mention of KOReader anywhere). A fake positive here is harmless --
+-- Install still refuses it cleanly for lacking a _meta.lua -- but it's
+-- confusing noise in a browsing list, so filter out anything that gives no
+-- other sign of actually being a KOReader plugin.
+-- rapidjson decodes a JSON `null` into a special sentinel value -- not Lua
+-- nil, and not a string -- specifically so a table can still tell "key
+-- absent" apart from "key present but null". A bare `x or ""` doesn't catch
+-- it (the sentinel is truthy), so reading it as a string later (e.g.
+-- `:lower()`) crashes with "attempt to index a userdata value". GitHub
+-- routinely sends `description: null` for repos that don't have one, which
+-- is exactly what triggered this in practice -- every nullable string field
+-- read from a GitHub API response needs to go through this instead.
+local function json_str(v)
+    return type(v) == "string" and v or ""
+end
+
+local function json_num(v)
+    return type(v) == "number" and v or 0
+end
+
+local function looks_like_koreader_plugin(repo)
+    local name = json_str(repo.name):lower()
+    local desc = json_str(repo.description):lower()
+    return name:match("%.koplugin$") ~= nil
+        or desc:find("koreader", 1, true) ~= nil
+        or desc:find("koplugin", 1, true) ~= nil
+end
+
+-- Searches GitHub for repositories tagged with the koreader-plugin topic
+-- (the convention already used by appstore.koplugin, so third-party plugin
+-- authors are likely to already have it set). `opts.text` narrows further
+-- by name/description, `opts.sort` is "stars" or "updated", `opts.page` is
+-- 1-based. Returns (items, nil, total_count) on success -- total_count is
+-- GitHub's count *before* this function's own noise filtering, so callers
+-- can tell "genuinely zero matches" apart from "everything on this page got
+-- filtered out".
+local function repo_to_item(repo, fallback_owner)
+    local owner = (repo.owner and repo.owner.login) or fallback_owner
+    return {
+        owner        = owner,
+        name         = json_str(repo.name),
+        full_name    = json_str(repo.full_name),
+        description  = json_str(repo.description),
+        stars        = json_num(repo.stargazers_count),
+        updated_at   = json_str(repo.updated_at),
+        raw_base_url = github_raw_base_url(owner, repo.name),
+    }
+end
+
+-- The koreader-plugin topic is self-tagged and plenty of real plugins never
+-- set it -- every repo in this very fleet included (verified: none of them
+-- carry it). Topic search alone would never surface those. appstore.koplugin
+-- works around exactly this by running a *second*, independent search for
+-- repo names containing ".koplugin" and merging both result sets; this does
+-- the same, just fetched live per search rather than into a local cache.
+local function build_search_query(q, sort, page)
+    return string.format(
+        "q=%s&sort=%s&order=desc&page=%d&per_page=30",
+        url_encode(q), sort, page
+    )
+end
+
+function PluginManager:searchGithubPlugins(opts)
+    opts = opts or {}
+    local text = opts.text
+    local sort = opts.sort or "stars"
+    local page = opts.page or 1
+
+    local topic_q = "topic:koreader-plugin"
+    if text and text ~= "" then topic_q = topic_q .. " " .. text .. " in:name,description" end
+
+    local name_q = '".koplugin" in:name'
+    if text and text ~= "" then name_q = text .. " " .. name_q end
+
+    local by_topic, topic_err = github_api_get("/search/repositories", build_search_query(topic_q, sort, page))
+    local by_name,  name_err  = github_api_get("/search/repositories", build_search_query(name_q, sort, page))
+    if not by_topic and not by_name then
+        return nil, topic_err or name_err
+    end
+
+    local seen, items = {}, {}
+    local function add_all(data)
+        if not data then return end
+        for _, repo in ipairs(data.items or {}) do
+            -- Noise reduction: a fork with zero stars is very unlikely to be
+            -- a maintained, independent plugin worth surfacing.
+            local looks_like_fork_spam = repo.fork and json_num(repo.stargazers_count) == 0
+            if not looks_like_fork_spam and not seen[repo.full_name] and looks_like_koreader_plugin(repo) then
+                seen[repo.full_name] = true
+                items[#items + 1] = repo_to_item(repo)
+            end
+        end
+    end
+    add_all(by_topic)
+    add_all(by_name)
+
+    -- Merging two independently-sorted result sets breaks any single global
+    -- order, so re-sort the combined list locally.
+    if sort == "updated" then
+        table.sort(items, function(a, b) return (a.updated_at or "") > (b.updated_at or "") end)
+    else
+        table.sort(items, function(a, b) return a.stars > b.stars end)
+    end
+
+    local total_count = json_num(by_topic and by_topic.total_count) + json_num(by_name and by_name.total_count)
+    local has_more     = (by_topic and #(by_topic.items or {}) == 30) or (by_name and #(by_name.items or {}) == 30)
+    return items, nil, total_count, has_more
+end
+
+-- Lists every public repo owned by `owner` whose name looks like a plugin
+-- (".koplugin" suffix -- the convention this whole fleet, and most
+-- third-party authors, follow). This is deliberately independent of the
+-- koreader-plugin GitHub topic used by searchGithubPlugins above: many
+-- authors -- including every repo in this very fleet -- never set that
+-- topic at all, so browsing "everything user X made" needs a path that
+-- doesn't depend on it. Paginates up to 500 repos (5 pages), which comfortably
+-- covers even a very prolific account.
+function PluginManager:listGithubOwnerPlugins(owner)
+    local items = {}
+    for page = 1, 5 do
+        local query = string.format("type=owner&per_page=100&page=%d", page)
+        local data, err = github_api_get("/users/" .. url_encode(owner) .. "/repos", query)
+        if not data then
+            if #items == 0 then return nil, err end
+            break
+        end
+        if type(data) ~= "table" or #data == 0 then break end
+        for _, repo in ipairs(data) do
+            if json_str(repo.name):match("%.koplugin$") then
+                items[#items + 1] = repo_to_item(repo, owner)
+            end
+        end
+        if #data < 100 then break end
+    end
+    return items
 end
 
 -- ---------------------------------------------------------------------------
@@ -255,30 +561,34 @@ local function rm_rf(path)
     end
 end
 
-local function read_meta(path)
-    local f = io.open(path, "r")
-    if not f then return nil end
-    local src = f:read("*a")
-    f:close()
-
-    -- Isolate a field's value to its own line before extracting the string
-    -- out of it. A previous version matched fullname's string directly
-    -- against the rest of the file with a pattern like '[^"]*"([^"]*)"' --
-    -- fine for fullname = "Plain" or fullname = _("Plain"), but for
-    -- fullname = _([[Bracket]]) (no quote anywhere near it), that pattern
-    -- skipped straight past to the next field's quotes (e.g. version =
-    -- "1.2.3") and silently captured the version string as the fullname
-    -- instead. Bounding the search to one line first makes that impossible.
+-- Isolates a field's value to its own line before extracting the string out
+-- of it. A previous version matched fullname's string directly against the
+-- rest of the file with a pattern like '[^"]*"([^"]*)"' -- fine for
+-- fullname = "Plain" or fullname = _("Plain"), but for
+-- fullname = _([[Bracket]]) (no quote anywhere near it), that pattern
+-- skipped straight past to the next field's quotes (e.g. version = "1.2.3")
+-- and silently captured the version string as the fullname instead.
+-- Bounding the search to one line first makes that impossible. Shared by
+-- read_meta (a local _meta.lua on disk) and any caller parsing one fetched
+-- over the network (e.g. checking a Discover-installed plugin for updates).
+local function parse_meta(src)
     local function field(name_pat)
         local line = src:match(name_pat .. '%s*=%s*([^\n]+)')
         if not line then return nil end
         return line:match('%[%[(.-)%]%]') or line:match('"([^"]*)"')
     end
-
     return {
         fullname = field('fullname'),
         version  = field('version'),
     }
+end
+
+local function read_meta(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local src = f:read("*a")
+    f:close()
+    return parse_meta(src)
 end
 
 -- ---------------------------------------------------------------------------
@@ -300,9 +610,11 @@ function PluginManager:scanInstalled()
                 local meta = read_meta(_plugins_dir .. "/" .. entry .. "/_meta.lua")
                 if meta then
                     installed[id] = {
+                        id       = id,
                         version  = meta.version or "?",
                         fullname = meta.fullname or id,
                         dir      = entry,
+                        disabled = is_plugin_disabled(id),
                     }
                 end
             end
@@ -321,19 +633,10 @@ function PluginManager:_silentCheck()
     local ok, NetworkMgr = pcall(require, "ui/network/manager")
     if ok and NetworkMgr and not NetworkMgr:isConnected() then return end
 
-    local urls = self:getRepoURLs()
-    local results = {}
-    for _, url in ipairs(urls) do
-        local body = fetch_url(url)
-        if body then
-            local manifest = parse_json(body)
-            if manifest and manifest.plugins then
-                results[#results + 1] = { url = url, manifest = manifest }
-            end
-        end
-    end
-    if #results == 0 then return end
-    local manifest = self:mergeManifests(results)
+    local body = fetch_url(MANIFEST_URL)
+    if not body then return end
+    local manifest = parse_json(body)
+    if not manifest or not manifest.plugins then return end
     self._manifest = manifest
     self:saveManifestCache(manifest)
 
@@ -341,7 +644,7 @@ function PluginManager:_silentCheck()
     local n_update  = 0
     for _, p in ipairs(manifest.plugins) do
         local inst = installed[p.id]
-        if inst and is_newer(inst.version, p.version) then
+        if inst and is_newer(inst.version, p.version) and not self:isVersionIgnored(p.id, p.version) then
             n_update = n_update + 1
         end
     end
@@ -353,112 +656,43 @@ function PluginManager:_silentCheck()
     end
 end
 
--- ---------------------------------------------------------------------------
--- Multi-source helpers
--- ---------------------------------------------------------------------------
-
-function PluginManager:getRepoURLs()
+function PluginManager:showIgnoredDialog()
     self:ensureSettings()
-    local urls = { MANIFEST_URL }
-    local extra = self.settings:readSetting("extra_repos") or {}
-    for _, u in ipairs(extra) do urls[#urls + 1] = u end
-    return urls
-end
-
-function PluginManager:mergeManifests(results)
-    local merged = { plugins = {} }
-    local multi = #results > 1
-    for _, r in ipairs(results) do
-        local src = source_from_url(r.url)
-        for _, lib_key in ipairs(COMMON_LIB_KEYS) do
-            if not merged[lib_key] and r.manifest[lib_key] then
-                merged[lib_key] = r.manifest[lib_key]
-            end
-        end
-        for _, p in ipairs(r.manifest.plugins or {}) do
-            local entry = {}
-            for k, v in pairs(p) do entry[k] = v end
-            if multi then entry._source = src end
-            merged.plugins[#merged.plugins + 1] = entry
-        end
+    local ignored = self.settings:readSetting("ignored_versions") or {}
+    local ids = {}
+    for id, version in pairs(ignored) do
+        if version then ids[#ids + 1] = id end
     end
-    return merged
-end
+    table.sort(ids)
 
-function PluginManager:showManageReposDialog()
-    self:ensureSettings()
-    local extra = self.settings:readSetting("extra_repos") or {}
     local dlg
     local buttons = {}
 
-    buttons[#buttons + 1] = {{
-        text    = source_from_url(MANIFEST_URL) .. "  " .. _("(default)"),
-        enabled = false,
-    }}
-
-    for i, url in ipairs(extra) do
-        local idx = i
-        buttons[#buttons + 1] = {
-            { text = source_from_url(url), enabled = false },
-            {
-                text     = _("Remove"),
-                callback = function()
-                    UIManager:close(dlg)
-                    table.remove(extra, idx)
-                    self.settings:saveSetting("extra_repos", extra)
-                    self.settings:flush()
-                    self._manifest = nil
-                    self:showManageReposDialog()
-                end,
-            },
-        }
-    end
-
-    buttons[#buttons + 1] = {{
-        text     = _("Add source\u{2026}"),
-        callback = function()
-            UIManager:close(dlg)
-            local input = InputDialog:new{
-                title      = _("Add plugin source"),
-                input_hint = "https://raw.githubusercontent.com/user/repo/main/manifest.json",
-                buttons    = {{
-                    {
-                        text     = _("Cancel"),
-                        callback = function() UIManager:close(input) end,
-                    },
-                    {
-                        text             = _("Add"),
-                        is_enter_default = true,
-                        callback         = function()
-                            local url = input:getInputText():match("^%s*(.-)%s*$")
-                            UIManager:close(input)
-                            if url == "" or url == MANIFEST_URL then return end
-                            for _, u in ipairs(extra) do
-                                if u == url then return end
-                            end
-                            extra[#extra + 1] = url
-                            self.settings:saveSetting("extra_repos", extra)
-                            self.settings:flush()
-                            self._manifest = nil
-                            UIManager:show(InfoMessage:new{
-                                text    = _("Source added. Press Update to load its plugins."),
-                                timeout = 3,
-                            })
-                        end,
-                    },
-                }},
+    if #ids == 0 then
+        buttons[#buttons + 1] = {{ text = _("No ignored updates."), enabled = false }}
+    else
+        for _, id in ipairs(ids) do
+            local pid = id
+            buttons[#buttons + 1] = {
+                { text = pid .. "  v" .. ignored[id], enabled = false },
+                {
+                    text     = _("Un-ignore"),
+                    callback = function()
+                        UIManager:close(dlg)
+                        self:setIgnoredVersion(pid, nil)
+                        self:showIgnoredDialog()
+                    end,
+                },
             }
-            UIManager:show(input)
-            input:onShowKeyboard()
-        end,
-    }}
+        end
+    end
 
     buttons[#buttons + 1] = {{
         text     = _("Close"),
         callback = function() UIManager:close(dlg) end,
     }}
 
-    dlg = ButtonDialog:new{ title = _("Plugin sources"), buttons = buttons }
+    dlg = ButtonDialog:new{ title = _("Ignored updates"), buttons = buttons }
     UIManager:show(dlg)
 end
 
@@ -466,6 +700,12 @@ end
 -- Install helpers
 -- ---------------------------------------------------------------------------
 
+-- `lib_key` is a manifest.json top-level key naming a downloadable common/
+-- bundle -- "common" (game-common, ScreenBase-based games) or
+-- "sudoku_common" (sudoku-common, BaseScreen-based sudoku variants); see the
+-- project-sudoku-common-architecture memory for why the two are NOT
+-- interchangeable. Each plugin_info names the one it needs via its own
+-- common_lib field, which indexes straight into manifest[lib_key] here.
 function PluginManager:ensureCommon(manifest, lib_key)
     local spec = manifest[lib_key]
     local lib_dir = _plugins_dir .. "/" .. spec.dir
@@ -600,11 +840,506 @@ function PluginManager:_doInstall(plugin_info, manifest)
 end
 
 -- ---------------------------------------------------------------------------
+-- Discover: install a plugin from an arbitrary GitHub repo (zip archive)
+-- ---------------------------------------------------------------------------
+
+-- GitHub zipballs always wrap their contents in a single top folder named
+-- "<owner>-<repo>-<sha>/", so a repo that IS a plugin (the convention used
+-- across this whole fleet: a repo named e.g. "foo.koplugin" with _meta.lua
+-- at its root) never actually has a path segment ending in ".koplugin" --
+-- that only happens for a monorepo nesting a plugin in a subfolder. Handle
+-- both: prefer a ".koplugin"-suffixed path segment when present, otherwise
+-- fall back to deriving the name from the repo itself.
+local function detect_plugin_layout(reader, repo_name)
+    local plugin_root, meta_path
+    for entry in reader:iterate() do
+        if entry.mode == "file" and entry.path:match("/_meta%.lua$") then
+            local candidate_root = entry.path:match("^(.*)/_meta%.lua$")
+            -- Prefer the shallowest match, in case a monorepo nests more
+            -- than one .koplugin folder.
+            if not meta_path or #candidate_root < #plugin_root then
+                plugin_root, meta_path = candidate_root, entry.path
+            end
+        end
+    end
+    if not plugin_root then
+        return nil, _("No _meta.lua found in this repository's archive.")
+    end
+    local dirname = plugin_root:match("([^/]+%.koplugin)$")
+    if not dirname then
+        dirname = repo_name:match("%.koplugin$") and repo_name or (repo_name .. ".koplugin")
+    end
+    return { plugin_root = plugin_root, dirname = dirname }
+end
+
+-- Extracts every file entry under `plugin_root` into `dest_dir`, preserving
+-- its relative path. Iterating fresh here (rather than reusing whatever
+-- position detect_plugin_layout's own iterate() loop left the reader at)
+-- matters: ffi/archiver's iterate() resets to the start of the archive on
+-- every call unless told to keep position, so this is a clean second pass,
+-- not a continuation.
+local function extract_archive(reader, plugin_root, dest_dir)
+    mkdir_p(dest_dir)
+    local prefix = plugin_root .. "/"
+    for entry in reader:iterate() do
+        if entry.mode == "file" and entry.path:sub(1, #prefix) == prefix then
+            local relative = entry.path:sub(#prefix + 1)
+            local dest_path = dest_dir .. "/" .. relative
+            local subdir = relative:match("^(.*)/[^/]+$")
+            if subdir then mkdir_p(dest_dir .. "/" .. subdir) end
+            if not reader:extractToPath(entry.path, dest_path) then
+                return false, string.format(_("Failed to extract %s"), relative)
+            end
+        end
+    end
+    return true
+end
+
+-- Returns a human-readable description of whatever is already installed at
+-- `dirname` (or nil if nothing is there, or if it's already tracked to this
+-- exact `repo` -- that's just a normal reinstall/update, not a conflict).
+-- The plugin's install directory is derived purely from the repo's own
+-- name, so a same-named repo from a *different* owner -- or one of this
+-- fleet's own manifest.json plugins -- can collide with an entirely
+-- unrelated plugin already occupying that same plugins/<name>.koplugin
+-- folder; without this check, installFromGithubRepo would silently
+-- overwrite it.
+function PluginManager:describeExistingInstall(dirname, repo)
+    local lfs = get_lfs()
+    if not lfs or lfs.attributes(_plugins_dir .. "/" .. dirname, "mode") ~= "directory" then
+        return nil
+    end
+    local id            = dirname:match("^(.*)%.koplugin$") or dirname
+    local existing_repo = self:getDiscoverInstall(id)
+    if existing_repo and repo and existing_repo.owner == repo.owner and existing_repo.name == repo.name then
+        return nil
+    end
+
+    local meta     = read_meta(_plugins_dir .. "/" .. dirname .. "/_meta.lua")
+    local fullname = (meta and meta.fullname) or id
+    local version  = (meta and meta.version) or "?"
+    local source
+    if existing_repo then
+        source = existing_repo.full_name
+    else
+        local in_manifest = false
+        if self._manifest then
+            for _, p in ipairs(self._manifest.plugins) do
+                if p.id == id then in_manifest = true break end
+            end
+        end
+        source = in_manifest and _("the koreader-plugins repository") or _("an untracked local install")
+    end
+    return string.format(_("%s v%s (from %s)"), fullname, version, source)
+end
+
+-- `on_done(ok, err)`, if given, is called exactly once at the very end of
+-- the attempt (success or failure) -- lets installAllFromGithub chain
+-- installs one at a time without duplicating any of this logic.
+function PluginManager:installFromGithubRepo(repo, on_done)
+    local ok_arc, Archiver = pcall(require, "ffi/archiver")
+    if not ok_arc then
+        UIManager:show(InfoMessage:new{ text = _("Archive support not available."), timeout = 4 })
+        if on_done then on_done(false, _("Archive support not available.")) end
+        return
+    end
+
+    local zip_url  = string.format("https://api.github.com/repos/%s/%s/zipball", repo.owner, repo.name)
+    local zip_dir  = DataStorage:getDataDir() .. "/cache/pluginmanager"
+    mkdir_p(zip_dir)
+    local zip_path = string.format("%s/%s-%d.zip", zip_dir, repo.name, os.time())
+
+    local progress = InfoMessage:new{ text = string.format(_("Downloading %s\u{2026}"), repo.full_name or repo.name) }
+    UIManager:show(progress)
+    UIManager:scheduleIn(0.2, function()
+        local ok_dl, dl_err = safe_call(function() return fetch_to_file(zip_url, zip_path, github_headers()) end)
+        UIManager:close(progress)
+        if not ok_dl then
+            UIManager:show(InfoMessage:new{
+                text    = _("Download failed:") .. "\n" .. (dl_err or "?"),
+                timeout = 5,
+            })
+            if on_done then on_done(false, dl_err) end
+            return
+        end
+
+        local reader = Archiver.Reader:new()
+        if not safe_call(function() return reader:open(zip_path) end) then
+            os.remove(zip_path)
+            UIManager:show(InfoMessage:new{ text = _("Failed to open downloaded archive."), timeout = 5 })
+            if on_done then on_done(false, _("Failed to open downloaded archive.")) end
+            return
+        end
+
+        local layout, derr = safe_call(function() return detect_plugin_layout(reader, repo.name) end)
+        if not layout then
+            reader:close()
+            os.remove(zip_path)
+            UIManager:show(InfoMessage:new{
+                text    = derr or _("Could not detect a plugin inside this repository."),
+                timeout = 5,
+            })
+            if on_done then on_done(false, derr) end
+            return
+        end
+
+        local dest_dir = _plugins_dir .. "/" .. layout.dirname
+
+        local function proceed()
+            local eok, eerr = safe_call(function() return extract_archive(reader, layout.plugin_root, dest_dir) end)
+            reader:close()
+            os.remove(zip_path)
+
+            if not eok then
+                -- Don't leave a half-written plugin directory behind:
+                -- KOReader would try to load it at next startup and fail on
+                -- missing files.
+                rm_rf(dest_dir)
+                UIManager:show(InfoMessage:new{
+                    text    = _("Installation failed:") .. "\n" .. (eerr or "?"),
+                    timeout = 5,
+                })
+                if on_done then on_done(false, eerr) end
+                return
+            end
+
+            local meta = read_meta(dest_dir .. "/_meta.lua")
+            local id   = layout.dirname:match("^(.*)%.koplugin$") or layout.dirname
+            self:recordDiscoverInstall(id, repo)
+            UIManager:show(InfoMessage:new{
+                text    = string.format(
+                    _("%s installed.\nPlease restart KOReader to load it."),
+                    (meta and meta.fullname) or repo.name
+                ),
+                timeout = 8,
+            })
+            if on_done then on_done(true) end
+        end
+
+        local conflict = self:describeExistingInstall(layout.dirname, repo)
+        if conflict then
+            UIManager:show(ConfirmBox:new{
+                text        = string.format(
+                    _("%s\nis already installed at %s.\nInstalling %s here will overwrite it. Continue?"),
+                    conflict, layout.dirname, repo.full_name
+                ),
+                ok_text     = _("Overwrite"),
+                ok_callback = proceed,
+                cancel_callback = function()
+                    reader:close()
+                    os.remove(zip_path)
+                    if on_done then on_done(false, _("Cancelled: a different plugin already occupies this folder.")) end
+                end,
+            })
+            return
+        end
+
+        proceed()
+    end)
+end
+
+-- Installs every repo in `repos` one at a time (never in parallel -- keeps
+-- memory pressure and GitHub API usage predictable, same reasoning as the
+-- manifest-driven bulk install in _runBulkInstall), then shows one summary.
+function PluginManager:installAllFromGithub(repos)
+    local total  = #repos
+    local failed = {}
+    local function step(i)
+        if i > total then
+            local parts = {}
+            if #failed > 0 then
+                parts[#parts + 1] = string.format(_("%d/%d installed. Failures:"), total - #failed, total)
+                for _, f in ipairs(failed) do parts[#parts + 1] = f end
+            else
+                parts[#parts + 1] = string.format(
+                    _("%d plugin(s) installed.\nPlease restart KOReader to load them."), total
+                )
+            end
+            UIManager:show(InfoMessage:new{ text = table.concat(parts, "\n"), timeout = 10 })
+            return
+        end
+        local repo = repos[i]
+        self:installFromGithubRepo(repo, function(ok, err)
+            if not ok then
+                failed[#failed + 1] = repo.full_name .. ": " .. (err or "?")
+            end
+            step(i + 1)
+        end)
+    end
+    step(1)
+end
+
+function PluginManager:getDiscoverSort()
+    self:ensureSettings()
+    return self.settings:readSetting("discover_sort_mode") or "stars"
+end
+
+function PluginManager:cycleDiscoverSort()
+    local next_mode = self:getDiscoverSort() == "stars" and "updated" or "stars"
+    self:ensureSettings()
+    self.settings:saveSetting("discover_sort_mode", next_mode)
+    self.settings:flush()
+    return next_mode
+end
+
+function PluginManager:showDiscoverFilterDialog(link_target)
+    local input
+    input = InputDialog:new{
+        title       = _("Search GitHub plugins"),
+        description = _("Type user:NAME to browse every .koplugin repo from one GitHub account."),
+        input       = self._discover_filter or "",
+        input_hint  = _("Search text (optional)\u{2026}"),
+        buttons    = {{
+            {
+                text     = _("Clear"),
+                callback = function()
+                    UIManager:close(input)
+                    self._discover_filter = nil
+                    self:showDiscoverDialog(link_target)
+                end,
+            },
+            {
+                text     = _("Cancel"),
+                callback = function()
+                    UIManager:close(input)
+                    self:showDiscoverDialog(link_target)
+                end,
+            },
+            {
+                text             = _("Search"),
+                is_enter_default = true,
+                callback         = function()
+                    local text = input:getInputText():match("^%s*(.-)%s*$")
+                    UIManager:close(input)
+                    self._discover_filter = text ~= "" and text or nil
+                    self:showDiscoverDialog(link_target)
+                end,
+            },
+        }},
+    }
+    UIManager:show(input)
+    input:onShowKeyboard()
+end
+
+function PluginManager:showDiscoveredRepoDialog(repo)
+    local dlg
+    local title = repo.full_name .. string.format("  \u{2605}%d", repo.stars)
+    if repo.description and repo.description ~= "" then
+        title = title .. "\n" .. repo.description
+    end
+    dlg = ButtonDialog:new{
+        title   = title,
+        buttons = {
+            {{
+                text     = _("Install"),
+                callback = function()
+                    UIManager:close(dlg)
+                    UIManager:show(ConfirmBox:new{
+                        text    = string.format(
+                            _("Install %s from GitHub?\nThis downloads and runs third-party code \u{2014} only install plugins you trust."),
+                            repo.full_name
+                        ),
+                        ok_text     = _("Install"),
+                        ok_callback = function() self:installFromGithubRepo(repo) end,
+                    })
+                end,
+            }},
+            {{
+                text     = _("README\u{2026}"),
+                callback = function()
+                    UIManager:close(dlg)
+                    self:showReadme(
+                        repo.raw_base_url .. "README.md",
+                        string.format(_("README: %s"), repo.full_name),
+                        repo.owner .. "_" .. repo.name
+                    )
+                end,
+            }},
+            {{
+                text     = _("Cancel"),
+                callback = function() UIManager:close(dlg) end,
+            }},
+        },
+    }
+    UIManager:show(dlg)
+end
+
+-- `link_target`, when given, switches the whole Discover flow from "browse
+-- to install" into "browse to link" mode: tapping a result links it to
+-- `link_target` (an installed-but-untracked plugin's inst_info, from
+-- showLinkRepoDialog's "Search GitHub…") instead of opening the normal
+-- install/README dialog. This is threaded through every function in this
+-- flow (filter dialog, sort toggle, "Load more") so the mode survives
+-- filtering/paging within the same browsing session.
+function PluginManager:showDiscoverDialog(link_target)
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    if ok and NetworkMgr then
+        NetworkMgr:runWhenOnline(function() self:_showDiscoverDialog(1, {}, link_target) end)
+    else
+        self:_showDiscoverDialog(1, {}, link_target)
+    end
+end
+
+-- Confirms, then installs every repo currently shown, one at a time. Warns
+-- about GitHub's unauthenticated rate limit up front for a large batch --
+-- each install is a separate zipball download against the *core* API
+-- (60 requests/hour unauthenticated, shared with everything else this
+-- plugin does against api.github.com), easy to exceed with more than a
+-- couple dozen repos in one go.
+function PluginManager:confirmInstallAll(repos)
+    local text = string.format(_("Install all %d plugins shown?"), #repos)
+    if #repos > 20 and not github_config().github_token then
+        text = text .. "\n" .. _("GitHub's unauthenticated rate limit is low (60 requests/hour) and this many installs may hit it partway through; see Configuration in the README to set a token first.")
+    end
+    UIManager:show(ConfirmBox:new{
+        text        = text,
+        ok_text     = _("Install all"),
+        ok_callback = function() self:installAllFromGithub(repos) end,
+    })
+end
+
+function PluginManager:confirmLinkRepo(link_target, repo)
+    UIManager:show(ConfirmBox:new{
+        text        = string.format(_("Link %s to %s?"), link_target.fullname, repo.full_name),
+        ok_text     = _("Link"),
+        ok_callback = function() self:verifyAndLinkRepo(link_target, repo.owner, repo.name) end,
+    })
+end
+
+-- `accumulated` carries results from previous pages across "Load more" taps,
+-- so paging in doesn't lose what was already fetched. `page`/`accumulated`
+-- are meaningless in owner-browse mode (listGithubOwnerPlugins already
+-- returns everything in one call), but are threaded through regardless to
+-- keep this a single entry point for both modes.
+function PluginManager:_showDiscoverDialog(page, accumulated, link_target)
+    local owner_query = self._discover_filter and self._discover_filter:match("^user:%s*(.+)$")
+
+    local notice = InfoMessage:new{ text = _("Searching GitHub\u{2026}") }
+    UIManager:show(notice)
+    UIManager:scheduleIn(0.2, function()
+        UIManager:close(notice)
+        local results, err, total_count, has_more
+        if owner_query then
+            results, err = self:listGithubOwnerPlugins(owner_query)
+        else
+            results, err, total_count, has_more = self:searchGithubPlugins{
+                text = self._discover_filter,
+                sort = self:getDiscoverSort(),
+                page = page,
+            }
+        end
+        if not results then
+            UIManager:show(InfoMessage:new{
+                text    = _("Search failed:") .. "\n" .. (err or "?"),
+                timeout = 5,
+            })
+            return
+        end
+        for _, r in ipairs(results) do accumulated[#accumulated + 1] = r end
+
+        if #accumulated == 0 then
+            if owner_query then
+                UIManager:show(InfoMessage:new{
+                    text    = string.format(_("No .koplugin repositories found for \u{201c}%s\u{201d}."), owner_query),
+                    timeout = 4,
+                })
+            elseif self._discover_filter then
+                -- A filter that's still set from a previous search is the
+                -- most likely reason this comes back empty on a later
+                -- attempt (the text must still match somewhere), so surface
+                -- it and offer the fix directly rather than leaving the
+                -- dialog looking like Discover has simply stopped working.
+                UIManager:show(ConfirmBox:new{
+                    text        = string.format(
+                        _("No results for \u{201c}%s\u{201d} (%d repositories are candidates in total, before that filter).\nClear the filter and search again?"),
+                        self._discover_filter, total_count or 0
+                    ),
+                    ok_text     = _("Clear filter"),
+                    ok_callback = function()
+                        self._discover_filter = nil
+                        self:showDiscoverDialog(link_target)
+                    end,
+                    cancel_text = _("Close"),
+                })
+            else
+                UIManager:show(InfoMessage:new{ text = _("No results."), timeout = 3 })
+            end
+            return
+        end
+
+        local Menu   = require("ui/widget/menu")
+        local Screen = require("device").screen
+        local items  = {}
+        if not link_target and #accumulated >= 2 then
+            items[#items + 1] = {
+                text     = string.format(_("Install all %d shown\u{2026}"), #accumulated),
+                bold     = true,
+                callback = function() self:confirmInstallAll(accumulated) end,
+            }
+        end
+        for _, repo in ipairs(accumulated) do
+            local pref = repo
+            items[#items + 1] = {
+                text      = repo.full_name,
+                mandatory = string.format("\u{2605}%d", repo.stars),
+                callback  = function()
+                    if link_target then
+                        self:confirmLinkRepo(link_target, pref)
+                    else
+                        self:showDiscoveredRepoDialog(pref)
+                    end
+                end,
+            }
+        end
+        if not owner_query and has_more then
+            -- At least one of the two merged queries had a full page: there
+            -- may well be more.
+            items[#items + 1] = {
+                text     = _("Load more\u{2026}"),
+                callback = function() self:_showDiscoverDialog(page + 1, accumulated, link_target) end,
+            }
+        end
+
+        local menu_instance
+        menu_instance = Menu:new{
+            title               = link_target
+                and string.format(_("Select repo for %s"), link_target.fullname)
+                or  _("Discover plugins"),
+            subtitle            = self._discover_filter and string.format(_("Search: %s"), self._discover_filter) or nil,
+            item_table          = items,
+            width               = Screen:getWidth(),
+            height              = Screen:getHeight(),
+            title_bar_left_icon = "appbar.search",
+            onLeftButtonTap     = function()
+                UIManager:close(menu_instance)
+                self:showDiscoverFilterDialog(link_target)
+            end,
+            onLeftButtonHold    = function()
+                local mode = self:cycleDiscoverSort()
+                UIManager:close(menu_instance)
+                UIManager:show(InfoMessage:new{
+                    text    = mode == "updated" and _("Sorted by last updated.") or _("Sorted by stars."),
+                    timeout = 2,
+                })
+                self:showDiscoverDialog(link_target)
+            end,
+        }
+        function menu_instance:onMenuChoice(item)
+            UIManager:close(self)
+            if item.callback then item.callback() end
+        end
+        UIManager:show(menu_instance)
+    end)
+end
+
+-- ---------------------------------------------------------------------------
 -- Remove
 -- ---------------------------------------------------------------------------
 
 function PluginManager:_doRemove(fullname, plugin_dir)
     rm_rf(_plugins_dir .. "/" .. plugin_dir)
+    local id = plugin_dir:match("^(.*)%.koplugin$")
+    if id then self:forgetDiscoverInstall(id) end
     UIManager:show(InfoMessage:new{
         text    = string.format(_("%s removed."), fullname),
         timeout = 5,
@@ -641,12 +1376,109 @@ function PluginManager:_cleanupRenamed(manifest)
 end
 
 -- ---------------------------------------------------------------------------
+-- README viewer
+-- ---------------------------------------------------------------------------
+
+-- TextViewer only gained Markdown rendering (text_format = "md") in KOReader
+-- v2026.07 -- older versions still show the raw README fine, just unstyled.
+local function textviewer_supports_md()
+    local ok, Version = pcall(require, "version")
+    if not ok then return false end
+    local current = Version:getNormalizedCurrentVersion()
+    local min     = Version:getNormalizedVersion("v2026.07")
+    return current and min and current >= min
+end
+
+local function readme_cache_path(cache_key)
+    return DataStorage:getDataDir() .. "/cache/pluginmanager/readme_" .. cache_key:gsub("[^%w%-%.]", "_") .. ".md"
+end
+
+local function load_readme_cache(cache_key)
+    local f = io.open(readme_cache_path(cache_key), "r")
+    if not f then return nil end
+    local body = f:read("*a")
+    f:close()
+    return body ~= "" and body or nil
+end
+
+function PluginManager:_displayReadme(body, url, title, cache_key)
+    local TextViewer = require("ui/widget/textviewer")
+    UIManager:show(TextViewer:new{
+        title                = title,
+        text                 = body,
+        text_format          = textviewer_supports_md() and "md" or nil,
+        add_default_buttons  = true,
+        buttons_table        = {{
+            {
+                text     = _("Refresh"),
+                callback = function() self:_fetchAndShowReadme(url, title, cache_key) end,
+            },
+        }},
+    })
+end
+
+function PluginManager:_fetchAndShowReadme(url, title, cache_key)
+    local notice = InfoMessage:new{ text = _("Fetching README\u{2026}") }
+    UIManager:show(notice)
+    UIManager:scheduleIn(0.2, function()
+        UIManager:close(notice)
+        local body, err = fetch_url(url)
+        if not body then
+            UIManager:show(InfoMessage:new{
+                text    = _("README download failed:") .. "\n" .. (err or "?"),
+                timeout = 5,
+            })
+            return
+        end
+        local cache_path = readme_cache_path(cache_key)
+        mkdir_p(cache_path:match("^(.*)/"))
+        write_file(cache_path, body)
+        self:_displayReadme(body, url, title, cache_key)
+    end)
+end
+
+-- Shows `url`'s README, caching the result to disk so reopening the same
+-- README later (or offline) is instant instead of re-downloading every
+-- time. `cache_key` identifies the cache file (plugin id, or "owner_repo"
+-- for a Discover result) and is sanitised for filesystem safety. A
+-- "Refresh" button on the viewer lets the user force a re-download when
+-- they actually want the latest copy.
+function PluginManager:showReadme(url, title, cache_key)
+    if not url then
+        UIManager:show(InfoMessage:new{
+            text    = _("No README available for this source."),
+            timeout = 4,
+        })
+        return
+    end
+
+    local cached = load_readme_cache(cache_key)
+    if cached then
+        self:_displayReadme(cached, url, title, cache_key)
+        return
+    end
+    self:_fetchAndShowReadme(url, title, cache_key)
+end
+
+-- ---------------------------------------------------------------------------
 -- Per-plugin dialogs
 -- ---------------------------------------------------------------------------
 
 function PluginManager:showInstalledDialog(plugin_info, inst_info, has_update)
     local dlg
     local buttons = {}
+
+    buttons[#buttons + 1] = {{
+        text     = _("README\u{2026}"),
+        callback = function()
+            UIManager:close(dlg)
+            self:showReadme(
+                plugin_info.raw_base_url and (plugin_info.raw_base_url .. "README.md") or nil,
+                string.format(_("README: %s"), plugin_info.fullname),
+                plugin_info.id
+            )
+        end,
+    }}
 
     if has_update then
         local pref = plugin_info
@@ -655,6 +1487,20 @@ function PluginManager:showInstalledDialog(plugin_info, inst_info, has_update)
             callback = function()
                 UIManager:close(dlg)
                 self:_doInstall(pref, self._manifest)
+            end,
+        }}
+        buttons[#buttons + 1] = {{
+            text     = string.format(_("Ignore v%s"), plugin_info.version),
+            callback = function()
+                UIManager:close(dlg)
+                self:setIgnoredVersion(pref.id, pref.version)
+                UIManager:show(InfoMessage:new{
+                    text    = string.format(
+                        _("v%s will be hidden from updates until a newer version is released.\nSee \u{201c}Ignored updates\u{2026}\u{201d} in the main menu to undo."),
+                        pref.version
+                    ),
+                    timeout = 5,
+                })
             end,
         }}
     end
@@ -680,6 +1526,25 @@ function PluginManager:showInstalledDialog(plugin_info, inst_info, has_update)
     }}
 
     local iref = inst_info
+    local pid  = plugin_info.id
+    if pid ~= "pluginmanager" then
+        -- Disabling Plugin Manager itself would lock the user out of the
+        -- only UI that could re-enable it.
+        buttons[#buttons + 1] = {{
+            text     = iref.disabled and _("Enable") or _("Disable"),
+            callback = function()
+                UIManager:close(dlg)
+                set_plugin_disabled(pid, not iref.disabled)
+                UIManager:show(InfoMessage:new{
+                    text    = iref.disabled
+                        and string.format(_("%s enabled.\nRestart KOReader to apply."), iref.fullname)
+                        or  string.format(_("%s disabled.\nRestart KOReader to apply."), iref.fullname),
+                    timeout = 5,
+                })
+            end,
+        }}
+    end
+
     buttons[#buttons + 1] = {{
         text     = _("Remove"),
         callback = function()
@@ -704,11 +1569,12 @@ function PluginManager:showInstalledDialog(plugin_info, inst_info, has_update)
 
     -- Title: name + version arrow + description
     local title = inst_info.fullname .. "  v" .. inst_info.version
+    if iref.disabled then title = title .. "  " .. _("[DISABLED]") end
     if has_update then
         title = title .. "  \u{2192}  v" .. plugin_info.version
     end
-    if plugin_info.description and plugin_info.description ~= "" then
-        title = title .. "\n" .. plugin_info.description
+    if json_str(plugin_info.description) ~= "" then
+        title = title .. "\n" .. json_str(plugin_info.description)
     end
 
     dlg = ButtonDialog:new{ title = title, buttons = buttons }
@@ -718,8 +1584,8 @@ end
 function PluginManager:showAvailableDialog(plugin_info)
     local dlg
     local title = plugin_info.fullname .. "  v" .. plugin_info.version
-    if plugin_info.description and plugin_info.description ~= "" then
-        title = title .. "\n" .. plugin_info.description
+    if json_str(plugin_info.description) ~= "" then
+        title = title .. "\n" .. json_str(plugin_info.description)
     end
     dlg = ButtonDialog:new{
         title   = title,
@@ -732,6 +1598,17 @@ function PluginManager:showAvailableDialog(plugin_info)
                 end,
             }},
             {{
+                text     = _("README\u{2026}"),
+                callback = function()
+                    UIManager:close(dlg)
+                    self:showReadme(
+                        plugin_info.raw_base_url and (plugin_info.raw_base_url .. "README.md") or nil,
+                        string.format(_("README: %s"), plugin_info.fullname),
+                        plugin_info.id
+                    )
+                end,
+            }},
+            {{
                 text     = _("Cancel"),
                 callback = function() UIManager:close(dlg) end,
             }},
@@ -741,23 +1618,315 @@ function PluginManager:showAvailableDialog(plugin_info)
 end
 
 -- Dialog for a plugin installed locally but absent from the manifest.
+-- Fetches the current _meta.lua from `repo`'s default branch and offers to
+-- update if its version is newer than `iref`'s installed one. Reuses the
+-- exact same install path as a first install (installFromGithubRepo just
+-- re-downloads and re-extracts over the existing directory).
+function PluginManager:checkDiscoverUpdate(iref, repo)
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    local function run()
+        local notice = InfoMessage:new{ text = _("Checking for updates\u{2026}") }
+        UIManager:show(notice)
+        UIManager:scheduleIn(0.2, function()
+            UIManager:close(notice)
+            local url = github_raw_base_url(repo.owner, repo.name) .. "_meta.lua"
+            local body, err = fetch_url(url)
+            if not body then
+                UIManager:show(InfoMessage:new{
+                    text    = _("Update check failed:") .. "\n" .. (err or "?"),
+                    timeout = 5,
+                })
+                return
+            end
+            local remote_version = parse_meta(body).version
+            if not remote_version then
+                UIManager:show(InfoMessage:new{ text = _("Could not read the remote version."), timeout = 4 })
+                return
+            end
+            if not is_newer(iref.version, remote_version) then
+                UIManager:show(InfoMessage:new{ text = _("Already up to date."), timeout = 3 })
+                return
+            end
+            if self:isVersionIgnored(iref.id, remote_version) then
+                UIManager:show(InfoMessage:new{
+                    text    = string.format(
+                        _("v%s is available but ignored.\nSee \u{201c}Ignored updates\u{2026}\u{201d} in the main menu to undo."),
+                        remote_version
+                    ),
+                    timeout = 5,
+                })
+                return
+            end
+            local dlg
+            dlg = ButtonDialog:new{
+                title   = string.format(_("%s: v%s \u{2192} v%s"), iref.fullname, iref.version, remote_version),
+                buttons = {
+                    {{
+                        text     = string.format(_("Update to v%s"), remote_version),
+                        callback = function()
+                            UIManager:close(dlg)
+                            self:installFromGithubRepo(repo)
+                        end,
+                    }},
+                    {{
+                        text     = string.format(_("Ignore v%s"), remote_version),
+                        callback = function()
+                            UIManager:close(dlg)
+                            self:setIgnoredVersion(iref.id, remote_version)
+                            UIManager:show(InfoMessage:new{
+                                text    = string.format(
+                                    _("v%s will be hidden from updates until a newer version is released.\nSee \u{201c}Ignored updates\u{2026}\u{201d} in the main menu to undo."),
+                                    remote_version
+                                ),
+                                timeout = 5,
+                            })
+                        end,
+                    }},
+                    {{
+                        text     = _("Cancel"),
+                        callback = function() UIManager:close(dlg) end,
+                    }},
+                },
+            }
+            UIManager:show(dlg)
+        end)
+    end
+    if ok and NetworkMgr then NetworkMgr:runWhenOnline(run) else run() end
+end
+
+-- Fetches _meta.lua from owner/name's default branch to confirm it's
+-- actually a KOReader plugin before linking (mirrors appstore's "Match with
+-- URL" -- same idea, minus its SQLite-backed match bookkeeping). If it can't
+-- be verified (network hiccup, private repo, wrong owner/name typed), the
+-- user can still choose to link anyway rather than being blocked outright.
+function PluginManager:verifyAndLinkRepo(iref, owner, name)
+    local repo = { owner = owner, name = name, full_name = owner .. "/" .. name }
+    local function link()
+        self:recordDiscoverInstall(iref.id, repo)
+        UIManager:show(InfoMessage:new{
+            text    = string.format(_("Linked %s to %s."), iref.fullname, repo.full_name),
+            timeout = 4,
+        })
+    end
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    local function run()
+        local notice = InfoMessage:new{ text = _("Verifying repository\u{2026}") }
+        UIManager:show(notice)
+        UIManager:scheduleIn(0.2, function()
+            UIManager:close(notice)
+            local body = fetch_url(github_raw_base_url(owner, name) .. "_meta.lua")
+            if body and parse_meta(body).version then
+                link()
+            else
+                UIManager:show(ConfirmBox:new{
+                    text        = string.format(
+                        _("Could not verify %s (no _meta.lua found on its default branch). Link anyway?"),
+                        repo.full_name
+                    ),
+                    ok_text     = _("Link anyway"),
+                    ok_callback = link,
+                })
+            end
+        end)
+    end
+    if ok and NetworkMgr then NetworkMgr:runWhenOnline(run) else run() end
+end
+
+function PluginManager:showLinkRepoDialog(iref)
+    local input
+    input = InputDialog:new{
+        title       = _("Link to GitHub repo"),
+        description = string.format(
+            _("Enter the owner/repo this plugin came from, e.g. t2ym5u/%s."), iref.dir
+        ),
+        input       = "",
+        input_hint  = "owner/repo",
+        buttons     = {{
+            {
+                text     = _("Cancel"),
+                callback = function()
+                    UIManager:close(input)
+                    self:showLocalOnlyDialog(iref)
+                end,
+            },
+            {
+                text     = _("Search GitHub\u{2026}"),
+                callback = function()
+                    UIManager:close(input)
+                    self:showDiscoverDialog(iref)
+                end,
+            },
+            {
+                text             = _("Link"),
+                is_enter_default = true,
+                callback         = function()
+                    local text = input:getInputText():match("^%s*(.-)%s*$")
+                    UIManager:close(input)
+                    local owner, name = text:match("^([%w%-%_%.]+)/([%w%-%_%.]+)$")
+                    if not owner then
+                        UIManager:show(InfoMessage:new{
+                            text    = _("Enter as owner/repo, e.g. t2ym5u/sudoku.koplugin."),
+                            timeout = 4,
+                        })
+                        return
+                    end
+                    self:verifyAndLinkRepo(iref, owner, name)
+                end,
+            },
+        }},
+    }
+    UIManager:show(input)
+    input:onShowKeyboard()
+end
+
 function PluginManager:showLocalOnlyDialog(inst_info)
     local iref = inst_info
-    UIManager:show(ConfirmBox:new{
-        text        = string.format(
-            _("Remove %s?\nThis plugin is not in the repository.\nAll its files will be deleted."),
-            iref.fullname
-        ),
-        ok_text     = _("Remove"),
-        ok_callback = function()
-            self:_doRemove(iref.fullname, iref.dir)
+    local repo = self:getDiscoverInstall(iref.id)
+    local dlg
+    local buttons = {}
+
+    if repo then
+        buttons[#buttons + 1] = {{
+            text     = _("Check for update"),
+            callback = function()
+                UIManager:close(dlg)
+                self:checkDiscoverUpdate(iref, repo)
+            end,
+        }}
+        buttons[#buttons + 1] = {{
+            -- Unconditional re-download, regardless of version: for when the
+            -- local install is suspect (corrupted, half-written) or the
+            -- upstream repo doesn't bump _meta.lua's version between
+            -- changes, so "Check for update" would never notice.
+            text     = _("Reinstall"),
+            callback = function()
+                UIManager:close(dlg)
+                self:installFromGithubRepo(repo)
+            end,
+        }}
+        buttons[#buttons + 1] = {{
+            text     = _("README\u{2026}"),
+            callback = function()
+                UIManager:close(dlg)
+                self:showReadme(
+                    github_raw_base_url(repo.owner, repo.name) .. "README.md",
+                    string.format(_("README: %s"), repo.full_name),
+                    repo.owner .. "_" .. repo.name
+                )
+            end,
+        }}
+        buttons[#buttons + 1] = {{
+            text     = _("Unlink"),
+            callback = function()
+                UIManager:close(dlg)
+                self:forgetDiscoverInstall(iref.id)
+                self:showLocalOnlyDialog(iref)
+            end,
+        }}
+    else
+        -- No recorded source repo: this is a genuinely untracked
+        -- third-party plugin (installed by hand, from Discover before it
+        -- tracked sources, or removed from manifest.json). Offer to link it
+        -- to a GitHub repo -- same idea as appstore's "Match with URL" --
+        -- so it can get update checks and a README too.
+        buttons[#buttons + 1] = {{
+            text     = _("Link to GitHub repo\u{2026}"),
+            callback = function()
+                UIManager:close(dlg)
+                self:showLinkRepoDialog(iref)
+            end,
+        }}
+    end
+
+    buttons[#buttons + 1] = {{
+        text     = _("Remove"),
+        callback = function()
+            UIManager:close(dlg)
+            UIManager:show(ConfirmBox:new{
+                text        = string.format(
+                    _("Remove %s?\nAll plugin files will be deleted."),
+                    iref.fullname
+                ),
+                ok_text     = _("Remove"),
+                ok_callback = function()
+                    self:_doRemove(iref.fullname, iref.dir)
+                end,
+            })
         end,
-    })
+    }}
+    buttons[#buttons + 1] = {{
+        text     = _("Cancel"),
+        callback = function() UIManager:close(dlg) end,
+    }}
+
+    local title = iref.fullname .. "  v" .. iref.version
+    if repo then title = title .. "\n" .. repo.full_name end
+    dlg = ButtonDialog:new{ title = title, buttons = buttons }
+    UIManager:show(dlg)
 end
 
 -- ---------------------------------------------------------------------------
 -- Plugin list popup (paginated)
 -- ---------------------------------------------------------------------------
+
+-- Sort groups for "status" sort mode: updates first, then plain installed,
+-- then locally-installed-but-unknown, then not-yet-installed. "name" mode
+-- ignores this and sorts purely alphabetically.
+local SORT_GROUP_UPDATE       = 0
+local SORT_GROUP_INSTALLED    = 1
+local SORT_GROUP_LOCAL_ONLY   = 2
+local SORT_GROUP_AVAILABLE    = 3
+
+function PluginManager:getListSort()
+    self:ensureSettings()
+    return self.settings:readSetting("list_sort_mode") or "name"
+end
+
+function PluginManager:cycleListSort()
+    local next_mode = self:getListSort() == "name" and "status" or "name"
+    self:ensureSettings()
+    self.settings:saveSetting("list_sort_mode", next_mode)
+    self.settings:flush()
+    return next_mode
+end
+
+function PluginManager:showPluginListFilterDialog()
+    local input
+    input = InputDialog:new{
+        title      = _("Filter plugins"),
+        input      = self._list_filter or "",
+        input_hint = _("Plugin name\u{2026}"),
+        buttons    = {{
+            {
+                text     = _("Clear"),
+                callback = function()
+                    UIManager:close(input)
+                    self._list_filter = nil
+                    self:showPluginList()
+                end,
+            },
+            {
+                text     = _("Cancel"),
+                callback = function()
+                    UIManager:close(input)
+                    self:showPluginList()
+                end,
+            },
+            {
+                text             = _("Filter"),
+                is_enter_default = true,
+                callback         = function()
+                    local text = input:getInputText():match("^%s*(.-)%s*$")
+                    UIManager:close(input)
+                    self._list_filter = text ~= "" and text or nil
+                    self:showPluginList()
+                end,
+            },
+        }},
+    }
+    UIManager:show(input)
+    input:onShowKeyboard()
+end
 
 function PluginManager:showPluginList()
     local Menu   = require("ui/widget/menu")
@@ -771,12 +1940,12 @@ function PluginManager:showPluginList()
         for _, inst in pairs(installed) do
             local iref = inst
             items[#items + 1] = {
-                text      = iref.fullname,
-                mandatory = "v" .. iref.version,
-                callback  = function() self:showLocalOnlyDialog(iref) end,
+                text        = (iref.disabled and (_("[DISABLED]") .. " ") or "") .. iref.fullname,
+                mandatory   = "v" .. iref.version,
+                _sort_group = SORT_GROUP_INSTALLED,
+                callback    = function() self:showLocalOnlyDialog(iref) end,
             }
         end
-        table.sort(items, function(a, b) return a.text < b.text end)
         if #items == 0 then
             UIManager:show(InfoMessage:new{
                 text    = _("No plugins installed.\nPress Update to fetch the list."),
@@ -790,26 +1959,28 @@ function PluginManager:showPluginList()
             known_ids[p.id] = true
             local inst = installed[p.id]
             if inst then
-                local has_update = is_newer(inst.version, p.version)
+                local has_update = is_newer(inst.version, p.version) and not self:isVersionIgnored(p.id, p.version)
                 local detail = has_update
                     and ("v" .. inst.version .. " \u{2192} v" .. p.version)
                     or  ("v" .. inst.version)
                 local entry = { plugin = p, inst = inst, has_update = has_update }
                 items[#items + 1] = {
-                    text      = inst.fullname,
-                    mandatory = detail,
-                    bold      = has_update,
-                    callback  = function()
+                    text        = (inst.disabled and (_("[DISABLED]") .. " ") or "") .. inst.fullname,
+                    mandatory   = detail,
+                    bold        = has_update,
+                    _sort_group = has_update and SORT_GROUP_UPDATE or SORT_GROUP_INSTALLED,
+                    callback    = function()
                         self:showInstalledDialog(entry.plugin, entry.inst, entry.has_update)
                     end,
                 }
             else
                 local pref = p
                 items[#items + 1] = {
-                    text      = p.fullname,
-                    mandatory = "v" .. p.version,
-                    dim       = true,
-                    callback  = function() self:showAvailableDialog(pref) end,
+                    text        = p.fullname,
+                    mandatory   = "v" .. p.version,
+                    dim         = true,
+                    _sort_group = SORT_GROUP_AVAILABLE,
+                    callback    = function() self:showAvailableDialog(pref) end,
                 }
             end
         end
@@ -817,22 +1988,60 @@ function PluginManager:showPluginList()
         for id, inst in pairs(installed) do
             if not known_ids[id] then
                 local iref = inst
+                local tag  = self:getDiscoverInstall(id) and _("(GitHub)") or _("(local)")
                 items[#items + 1] = {
-                    text      = inst.fullname,
-                    mandatory = "v" .. inst.version .. " (local)",
-                    callback  = function() self:showLocalOnlyDialog(iref) end,
+                    text        = (inst.disabled and (_("[DISABLED]") .. " ") or "") .. inst.fullname,
+                    mandatory   = "v" .. inst.version .. " " .. tag,
+                    _sort_group = SORT_GROUP_LOCAL_ONLY,
+                    callback    = function() self:showLocalOnlyDialog(iref) end,
                 }
             end
         end
+    end
+
+    local filter = (self._list_filter or ""):lower()
+    if filter ~= "" then
+        local filtered = {}
+        for _, item in ipairs(items) do
+            if item.text:lower():find(filter, 1, true) then
+                filtered[#filtered + 1] = item
+            end
+        end
+        items = filtered
+    end
+
+    if self:getListSort() == "status" then
+        table.sort(items, function(a, b)
+            if a._sort_group ~= b._sort_group then return a._sort_group < b._sort_group end
+            return a.text < b.text
+        end)
+    else
         table.sort(items, function(a, b) return a.text < b.text end)
     end
 
     local menu_instance
     menu_instance = Menu:new{
-        title      = _("Plugins"),
-        item_table = items,
-        width      = Screen:getWidth(),
-        height     = Screen:getHeight(),
+        title               = _("Plugins"),
+        subtitle            = filter ~= "" and string.format(_("Filter: %s"), self._list_filter) or nil,
+        item_table          = items,
+        width               = Screen:getWidth(),
+        height              = Screen:getHeight(),
+        title_bar_left_icon = "appbar.search",
+        onLeftButtonTap     = function()
+            UIManager:close(menu_instance)
+            self:showPluginListFilterDialog()
+        end,
+        onLeftButtonHold    = function()
+            local mode = self:cycleListSort()
+            UIManager:close(menu_instance)
+            UIManager:show(InfoMessage:new{
+                text    = mode == "status"
+                    and _("Sorted by status (updates first).")
+                    or  _("Sorted by name."),
+                timeout = 2,
+            })
+            self:showPluginList()
+        end,
     }
     function menu_instance:onMenuChoice(item)
         UIManager:close(self)
@@ -845,36 +2054,29 @@ end
 -- Full update (fetch manifest + install new + update existing)
 -- ---------------------------------------------------------------------------
 
--- Fetches and merges every configured manifest source, and caches the
--- result on success. On failure, shows the network-error dialog itself and
--- returns nil -- callers can just bail out when manifest is nil.
-function PluginManager:_fetchAndMergeManifest()
-    local urls = self:getRepoURLs()
-    local results, errors = {}, {}
-    for _, url in ipairs(urls) do
-        local body, err = fetch_url(url)
-        if body then
-            local manifest = parse_json(body)
-            if manifest and manifest.plugins then
-                results[#results + 1] = { url = url, manifest = manifest }
-            else
-                errors[#errors + 1] = source_from_url(url) .. ": " .. _("invalid manifest")
-            end
-        else
-            errors[#errors + 1] = source_from_url(url) .. ": " .. (err or "?")
-        end
-    end
-    if #results == 0 then
+-- Fetches manifest.json and caches the result on success. On failure, shows
+-- the network-error dialog itself and returns nil -- callers can just bail
+-- out when manifest is nil.
+function PluginManager:_fetchManifest()
+    local body, err = fetch_url(MANIFEST_URL)
+    if not body then
         UIManager:show(InfoMessage:new{
-            text    = _("Network error:") .. "\n" .. table.concat(errors, "\n"),
+            text    = _("Network error:") .. "\n" .. (err or "?"),
             timeout = 5,
         })
-        return nil, errors
+        return nil
     end
-    local manifest = self:mergeManifests(results)
+    local manifest, jerr = parse_json(body)
+    if not manifest or not manifest.plugins then
+        UIManager:show(InfoMessage:new{
+            text    = _("Network error:") .. "\n" .. (jerr or _("invalid manifest")),
+            timeout = 5,
+        })
+        return nil
+    end
     self._manifest = manifest
     self:saveManifestCache(manifest)
-    return manifest, errors
+    return manifest
 end
 
 -- Shared by doFullUpdate and doFullReinstall: refreshes every shared
@@ -883,7 +2085,7 @@ end
 -- `opts` lets callers customise the three user-facing strings without
 -- duplicating this whole flow: nothing_to_do_text, done_text (takes one
 -- %d, the count), progress_text (same).
-function PluginManager:_runBulkInstall(manifest, errors, to_process, opts)
+function PluginManager:_runBulkInstall(manifest, to_process, opts)
     opts = opts or {}
     local installed = self:scanInstalled()
 
@@ -915,9 +2117,6 @@ function PluginManager:_runBulkInstall(manifest, errors, to_process, opts)
     if #to_process == 0 then
         local removed_renamed = safe_call(function() return self:_cleanupRenamed(manifest) end) or {}
         local parts = {}
-        if #errors > 0 then
-            parts[#parts + 1] = string.format(_("%d source(s) unavailable"), #errors)
-        end
         parts[#parts + 1] = opts.nothing_to_do_text or _("All plugins are up to date.")
         for _, fullname in ipairs(removed_renamed) do
             parts[#parts + 1] = string.format(_("Removed superseded %s."), fullname)
@@ -936,9 +2135,6 @@ function PluginManager:_runBulkInstall(manifest, errors, to_process, opts)
     local function finish()
         local removed_renamed = safe_call(function() return self:_cleanupRenamed(manifest) end) or {}
         local parts = {}
-        if #errors > 0 then
-            parts[#parts + 1] = string.format(_("%d source(s) unavailable"), #errors)
-        end
         if #failed > 0 then
             parts[#parts + 1] = string.format(
                 _("%d/%d done. Failures:"), total - #failed, total)
@@ -1014,19 +2210,19 @@ function PluginManager:_doFullUpdate()
     UIManager:show(notice)
     UIManager:scheduleIn(0.2, function()
         UIManager:close(notice)
-        local manifest, errors = self:_fetchAndMergeManifest()
+        local manifest = self:_fetchManifest()
         if not manifest then return end
 
         local installed  = self:scanInstalled()
         local to_process = {}
         for _, p in ipairs(manifest.plugins) do
             local inst = installed[p.id]
-            if not inst or is_newer(inst.version, p.version) then
+            if not inst or (is_newer(inst.version, p.version) and not self:isVersionIgnored(p.id, p.version)) then
                 to_process[#to_process + 1] = p
             end
         end
 
-        self:_runBulkInstall(manifest, errors, to_process)
+        self:_runBulkInstall(manifest, to_process)
     end)
 end
 
@@ -1087,7 +2283,7 @@ function PluginManager:_doFullReinstall()
     UIManager:show(notice)
     UIManager:scheduleIn(0.2, function()
         UIManager:close(notice)
-        local manifest, errors = self:_fetchAndMergeManifest()
+        local manifest = self:_fetchManifest()
         if not manifest then return end
 
         local installed  = self:scanInstalled()
@@ -1098,7 +2294,7 @@ function PluginManager:_doFullReinstall()
             end
         end
 
-        self:_runBulkInstall(manifest, errors, to_process, {
+        self:_runBulkInstall(manifest, to_process, {
             nothing_to_do_text = _("No plugins installed."),
             done_text          = _("%d plugin(s) reinstalled."),
             progress_text      = _("Reinstalling %d plugin(s)\u{2026}"),
@@ -1110,10 +2306,27 @@ end
 -- Main dialog
 -- ---------------------------------------------------------------------------
 
+-- ✓/✗ Wi-Fi radio state, refreshed every time the main dialog is (re)opened.
+-- isWifiOn() (as opposed to isConnected()) reflects the radio switch itself,
+-- which is what a user checking "is Wi-Fi on" actually wants to know. On
+-- devices without a Wi-Fi toggle it always returns true, so the line always
+-- reads "on" there -- harmless, since network is effectively always available.
+function PluginManager:wifiStatusLine()
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    if not ok or not NetworkMgr or not NetworkMgr.isWifiOn then return nil end
+    if NetworkMgr:isWifiOn() then
+        return _("\u{2713} Wi-Fi on")
+    end
+    return _("\u{2717} Wi-Fi off")
+end
+
 function PluginManager:showMainDialog()
     local dlg
+    local title = _("Plugin Manager")
+    local wifi_status = self:wifiStatusLine()
+    if wifi_status then title = title .. "\n" .. wifi_status end
     dlg = ButtonDialog:new{
-        title   = _("Plugin Manager"),
+        title   = title,
         buttons = {
             {{
                 text     = _("Update"),
@@ -1152,10 +2365,17 @@ function PluginManager:showMainDialog()
                 end,
             }},
             {{
-                text     = _("Manage sources\u{2026}"),
+                text     = _("Discover plugins\u{2026}"),
                 callback = function()
                     UIManager:close(dlg)
-                    self:showManageReposDialog()
+                    self:showDiscoverDialog()
+                end,
+            }},
+            {{
+                text     = _("Ignored updates\u{2026}"),
+                callback = function()
+                    UIManager:close(dlg)
+                    self:showIgnoredDialog()
                 end,
             }},
             {{
