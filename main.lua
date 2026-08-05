@@ -25,6 +25,7 @@ require("i18n").extend(lrequire("i18n_fr"))
 
 local MANIFEST_URL   = "https://raw.githubusercontent.com/t2ym5u/koreader-plugins/master/manifest.json"
 local AUTO_CHECK_TTL = 86400  -- re-check automatically at most once every 24 h
+local _patches_dir   = DataStorage:getPatchesDir()  -- koreader/patches, see frontend/userpatch.lua
 
 -- Runs fn(...) shielded from Lua errors (a bad manifest entry, an
 -- unexpected nil, a third-party source with malformed data...). Any escape
@@ -2462,6 +2463,745 @@ function PluginManager:_doFullReinstall()
 end
 
 -- ---------------------------------------------------------------------------
+-- Patches  (koreader/patches -- numbered *.lua files applied at startup;
+-- see frontend/userpatch.lua in the main koreader checkout)
+-- ---------------------------------------------------------------------------
+
+-- A patch file KOReader's own loader will actually pick up: leading digit(s)
+-- (the priority prefix, see userpatch.lua), a dash, then anything ending in
+-- ".lua". Renaming to "<name>.disabled" is the same trick appstore.koplugin
+-- uses to disable a single patch -- userpatch's own glob still matches the
+-- prefix, but its final "%.lua$" check then skips it, so KOReader stops
+-- loading it without the file having to be deleted.
+local function is_patch_filename(name)
+    return name:match("^%d+%-.+%.lua$") ~= nil
+end
+
+-- Mirrors looks_like_koreader_plugin's noise filter above, but for patch
+-- repositories: the koreader-user-patch topic is just as self-tagged and
+-- under-used, so the name-based fallback query below needs its own filter.
+local function looks_like_koreader_patch_repo(repo)
+    local name = json_str(repo.name):lower()
+    local desc = json_str(repo.description):lower()
+    return name:match("patches$") ~= nil
+        or name:find("koreader", 1, true) ~= nil
+        or (desc:find("koreader", 1, true) ~= nil and desc:find("patch", 1, true) ~= nil)
+end
+
+-- Searches GitHub for repositories carrying the koreader-user-patch topic
+-- (the convention appstore.koplugin uses) merged with a name/description
+-- fallback search -- same two-query strategy as searchGithubPlugins above,
+-- for the same reason: plenty of real patch repos never set the topic.
+function PluginManager:searchGithubPatchRepos(opts)
+    opts = opts or {}
+    local text = opts.text
+    local sort = opts.sort or "stars"
+    local page = opts.page or 1
+
+    local topic_q = "topic:koreader-user-patch"
+    if text and text ~= "" then topic_q = topic_q .. " " .. text .. " in:name,description" end
+
+    local name_q = "koreader patches in:name,description"
+    if text and text ~= "" then name_q = text .. " " .. name_q end
+
+    local by_topic, topic_err = github_api_get("/search/repositories", build_search_query(topic_q, sort, page))
+    local by_name,  name_err  = github_api_get("/search/repositories", build_search_query(name_q, sort, page))
+    if not by_topic and not by_name then
+        return nil, topic_err or name_err
+    end
+
+    local seen, items = {}, {}
+    local function add_all(data)
+        if not data then return end
+        for _, repo in ipairs(data.items or {}) do
+            local looks_like_fork_spam = repo.fork and json_num(repo.stargazers_count) == 0
+            if not looks_like_fork_spam and not seen[repo.full_name] and looks_like_koreader_patch_repo(repo) then
+                seen[repo.full_name] = true
+                items[#items + 1] = repo_to_item(repo)
+            end
+        end
+    end
+    add_all(by_topic)
+    add_all(by_name)
+
+    if sort == "updated" then
+        table.sort(items, function(a, b) return (a.updated_at or "") > (b.updated_at or "") end)
+    else
+        table.sort(items, function(a, b) return a.stars > b.stars end)
+    end
+
+    local total_count = json_num(by_topic and by_topic.total_count) + json_num(by_name and by_name.total_count)
+    local has_more     = (by_topic and #(by_topic.items or {}) == 30) or (by_name and #(by_name.items or {}) == 30)
+    return items, nil, total_count, has_more
+end
+
+-- Lists every patch file in `repo`: root-level files matching
+-- is_patch_filename, plus (if present) the same under a top-level
+-- "patches/" subfolder -- both conventions are common in the wild (checked
+-- against real repos: sebdelsol/KOReader.patches keeps them at the root,
+-- gennaro-tedesco/KOReader.patches nests them under patches/).
+function PluginManager:listRepoPatchFiles(repo)
+    local root, root_err = github_api_get(string.format("/repos/%s/%s/contents", url_encode(repo.owner), url_encode(repo.name)))
+    if not root then return nil, root_err end
+
+    local items, has_patches_dir = {}, false
+    for _, entry in ipairs(root) do
+        if entry.type == "file" and is_patch_filename(json_str(entry.name)) then
+            items[#items + 1] = { name = entry.name, path = entry.path, sha = entry.sha, download_url = entry.download_url, repo = repo }
+        elseif entry.type == "dir" and json_str(entry.name):lower() == "patches" then
+            has_patches_dir = true
+        end
+    end
+    if has_patches_dir then
+        local sub = github_api_get(string.format("/repos/%s/%s/contents/patches", url_encode(repo.owner), url_encode(repo.name)))
+        for _, entry in ipairs(sub or {}) do
+            if entry.type == "file" and is_patch_filename(json_str(entry.name)) then
+                items[#items + 1] = { name = entry.name, path = entry.path, sha = entry.sha, download_url = entry.download_url, repo = repo }
+            end
+        end
+    end
+    table.sort(items, function(a, b) return a.name < b.name end)
+    return items
+end
+
+-- ---------------------------------------------------------------------------
+-- Patches: installed-patch tracking (settings)
+-- ---------------------------------------------------------------------------
+
+-- Same idea as getDiscoverInstall/recordDiscoverInstall above, but keyed by
+-- patch filename (a patch has no id of its own) and also remembering the
+-- path within the repo (root or patches/) and the blob sha last installed,
+-- so a later "Check for update" has something to diff against -- patches
+-- carry no _meta.lua/version field to compare instead.
+function PluginManager:getPatchInstall(name)
+    self:ensureSettings()
+    local all = self.settings:readSetting("patch_installs") or {}
+    return all[name]
+end
+
+function PluginManager:recordPatchInstall(name, repo, path, sha)
+    self:ensureSettings()
+    local all = self.settings:readSetting("patch_installs") or {}
+    all[name] = { owner = repo.owner, name = repo.name, full_name = repo.full_name, path = path, sha = sha }
+    self.settings:saveSetting("patch_installs", all)
+    self.settings:flush()
+end
+
+function PluginManager:forgetPatchInstall(name)
+    self:ensureSettings()
+    local all = self.settings:readSetting("patch_installs") or {}
+    if all[name] == nil then return end
+    all[name] = nil
+    self.settings:saveSetting("patch_installs", all)
+    self.settings:flush()
+end
+
+-- Builds an installable item out of a previously-recorded link, for
+-- Reinstall/Update actions that don't already have a fresh listing result
+-- (from listRepoPatchFiles) to hand.
+local function patch_item_from_link(name, link)
+    return {
+        name         = name,
+        path         = link.path,
+        sha          = link.sha,
+        repo         = { owner = link.owner, name = link.name, full_name = link.full_name },
+        download_url = github_raw_base_url(link.owner, link.name) .. link.path,
+    }
+end
+
+-- ---------------------------------------------------------------------------
+-- Patches: installed scan / install / enable-disable
+-- ---------------------------------------------------------------------------
+
+function PluginManager:scanInstalledPatches()
+    local lfs = get_lfs()
+    if not lfs then return {} end
+    local installed = {}
+    pcall(function()
+        for entry in lfs.dir(_patches_dir) do
+            if entry ~= "." and entry ~= ".." and lfs.attributes(_patches_dir .. "/" .. entry, "mode") == "file" then
+                local disabled = entry:match("%.disabled$") ~= nil
+                local base     = disabled and entry:sub(1, -(#".disabled" + 1)) or entry
+                if is_patch_filename(base) then
+                    installed[base] = { name = base, file = entry, disabled = disabled }
+                end
+            end
+        end
+    end)
+    return installed
+end
+
+function PluginManager:installPatchFile(item)
+    mkdir_p(_patches_dir)
+    local body, err = fetch_url(item.download_url)
+    if not body then
+        return false, string.format(_("Download failed: %s \u{2014} %s"), item.name, err)
+    end
+    local dest, disabled_dest = _patches_dir .. "/" .. item.name, _patches_dir .. "/" .. item.name .. ".disabled"
+    local lfs = get_lfs()
+    if lfs and lfs.attributes(disabled_dest, "mode") == "file" then
+        -- Installing/updating always (re)enables the patch, matching what
+        -- Update does for plugins: a stale disabled copy under the same
+        -- name would otherwise sit alongside the freshly-installed one.
+        os.remove(disabled_dest)
+    end
+    local ok, werr = write_file(dest, body)
+    if not ok then
+        return false, string.format(_("Write failed: %s \u{2014} %s"), item.name, werr)
+    end
+    self:recordPatchInstall(item.name, item.repo, item.path, item.sha)
+    return true
+end
+
+function PluginManager:_doInstallPatch(item)
+    local msg = InfoMessage:new{ text = string.format(_("Installing %s\u{2026}"), item.name) }
+    UIManager:show(msg)
+    UIManager:scheduleIn(0.2, function()
+        UIManager:close(msg)
+        local ok, err = safe_call(function() return self:installPatchFile(item) end)
+        if ok then
+            UIManager:show(InfoMessage:new{
+                text    = string.format(_("%s installed.\nRestart KOReader to apply."), item.name),
+                timeout = 6,
+            })
+        else
+            logger.warn("PluginManager: patch install failed for", item.name, ":", err)
+            UIManager:show(InfoMessage:new{
+                text    = _("Install failed:") .. "\n" .. (err or "?"),
+                timeout = 5,
+            })
+        end
+    end)
+end
+
+function PluginManager:setPatchDisabled(name, disabled)
+    local plain, off = _patches_dir .. "/" .. name, _patches_dir .. "/" .. name .. ".disabled"
+    local lfs = get_lfs()
+    if not lfs then return end
+    if disabled and lfs.attributes(plain, "mode") == "file" then
+        os.rename(plain, off)
+    elseif not disabled and lfs.attributes(off, "mode") == "file" then
+        os.rename(off, plain)
+    end
+end
+
+function PluginManager:installAllPatches(items)
+    local total, failed = #items, {}
+    local function step(i)
+        if i > total then
+            local parts = {}
+            if #failed > 0 then
+                parts[#parts + 1] = string.format(_("%d/%d installed. Failures:"), total - #failed, total)
+                for _, f in ipairs(failed) do parts[#parts + 1] = f end
+            else
+                parts[#parts + 1] = string.format(_("%d patch(es) installed.\nRestart KOReader to apply."), total)
+            end
+            UIManager:show(InfoMessage:new{ text = table.concat(parts, "\n"), timeout = 8 })
+            return
+        end
+        local item = items[i]
+        local ok, err = safe_call(function() return self:installPatchFile(item) end)
+        if not ok then failed[#failed + 1] = item.name .. ": " .. (err or "?") end
+        UIManager:scheduleIn(0, function() step(i + 1) end)
+    end
+    step(1)
+end
+
+function PluginManager:confirmInstallAllPatches(items)
+    UIManager:show(ConfirmBox:new{
+        text        = string.format(_("Install all %d patches shown?"), #items),
+        ok_text     = _("Install all"),
+        ok_callback = function() self:installAllPatches(items) end,
+    })
+end
+
+-- ---------------------------------------------------------------------------
+-- Patches: update check
+-- ---------------------------------------------------------------------------
+
+-- Patches carry no _meta.lua/version field, so "is there an update" is a
+-- blob-sha comparison against what was recorded at install time -- the same
+-- approach appstore.koplugin uses for patches.
+function PluginManager:checkPatchUpdate(name, link)
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    local function run()
+        local notice = InfoMessage:new{ text = _("Checking for updates\u{2026}") }
+        UIManager:show(notice)
+        UIManager:scheduleIn(0.2, function()
+            UIManager:close(notice)
+            local data, err = github_api_get(string.format("/repos/%s/%s/contents/%s", url_encode(link.owner), url_encode(link.name), link.path))
+            if not data or not data.sha then
+                UIManager:show(InfoMessage:new{
+                    text    = _("Update check failed:") .. "\n" .. (err or "?"),
+                    timeout = 5,
+                })
+                return
+            end
+            if data.sha == link.sha then
+                UIManager:show(InfoMessage:new{ text = _("Already up to date."), timeout = 3 })
+                return
+            end
+            local item = patch_item_from_link(name, link)
+            item.sha, item.download_url = data.sha, data.download_url or item.download_url
+            local dlg
+            dlg = ButtonDialog:new{
+                title   = string.format(_("%s: update available"), name),
+                buttons = {
+                    {{
+                        text     = _("Update"),
+                        callback = function()
+                            UIManager:close(dlg)
+                            self:_doInstallPatch(item)
+                        end,
+                    }},
+                    {{
+                        text     = _("Cancel"),
+                        callback = function() UIManager:close(dlg) end,
+                    }},
+                },
+            }
+            UIManager:show(dlg)
+        end)
+    end
+    if ok and NetworkMgr then NetworkMgr:runWhenOnline(run) else run() end
+end
+
+-- ---------------------------------------------------------------------------
+-- Patches: Discover UI
+-- ---------------------------------------------------------------------------
+
+function PluginManager:getDiscoverPatchesSort()
+    self:ensureSettings()
+    return self.settings:readSetting("discover_patches_sort_mode") or "stars"
+end
+
+function PluginManager:cycleDiscoverPatchesSort()
+    local next_mode = self:getDiscoverPatchesSort() == "stars" and "updated" or "stars"
+    self:ensureSettings()
+    self.settings:saveSetting("discover_patches_sort_mode", next_mode)
+    self.settings:flush()
+    return next_mode
+end
+
+function PluginManager:showDiscoverPatchesFilterDialog()
+    local input
+    input = InputDialog:new{
+        title      = _("Search GitHub patches"),
+        input      = self._discover_patches_filter or "",
+        input_hint = _("Search text (optional)\u{2026}"),
+        buttons    = {{
+            {
+                text     = _("Clear"),
+                callback = function()
+                    UIManager:close(input)
+                    self._discover_patches_filter = nil
+                    self:showDiscoverPatchesDialog()
+                end,
+            },
+            {
+                text     = _("Cancel"),
+                callback = function()
+                    UIManager:close(input)
+                    self:showDiscoverPatchesDialog()
+                end,
+            },
+            {
+                text             = _("Search"),
+                is_enter_default = true,
+                callback         = function()
+                    local text = input:getInputText():match("^%s*(.-)%s*$")
+                    UIManager:close(input)
+                    self._discover_patches_filter = text ~= "" and text or nil
+                    self:showDiscoverPatchesDialog()
+                end,
+            },
+        }},
+    }
+    UIManager:show(input)
+    input:onShowKeyboard()
+end
+
+function PluginManager:showDiscoveredPatchDialog(item)
+    local dlg
+    local title = item.name
+    if item._installed then
+        title = title .. "\n" .. (item._installed.disabled and _("Already installed [DISABLED]") or _("Already installed"))
+    end
+    dlg = ButtonDialog:new{
+        title   = title,
+        buttons = {
+            {{
+                text     = _("Install"),
+                callback = function()
+                    UIManager:close(dlg)
+                    self:_doInstallPatch(item)
+                end,
+            }},
+            {{
+                text     = _("README\u{2026}"),
+                callback = function()
+                    UIManager:close(dlg)
+                    self:showReadme(
+                        github_raw_base_url(item.repo.owner, item.repo.name) .. "README.md",
+                        string.format(_("README: %s"), item.repo.full_name),
+                        item.repo.owner .. "_" .. item.repo.name
+                    )
+                end,
+            }},
+            {{
+                text     = _("Cancel"),
+                callback = function() UIManager:close(dlg) end,
+            }},
+        },
+    }
+    UIManager:show(dlg)
+end
+
+function PluginManager:showPatchRepoDialog(repo)
+    local notice = InfoMessage:new{ text = _("Loading patches\u{2026}") }
+    UIManager:show(notice)
+    UIManager:scheduleIn(0.2, function()
+        UIManager:close(notice)
+        local items, err = safe_call(function() return self:listRepoPatchFiles(repo) end)
+        if not items then
+            UIManager:show(InfoMessage:new{
+                text    = _("Could not list patches:") .. "\n" .. (err or "?"),
+                timeout = 5,
+            })
+            return
+        end
+        if #items == 0 then
+            UIManager:show(InfoMessage:new{
+                text    = string.format(_("No patch files found in %s."), repo.full_name),
+                timeout = 4,
+            })
+            return
+        end
+
+        local Menu      = require("ui/widget/menu")
+        local Screen    = require("device").screen
+        local installed = self:scanInstalledPatches()
+
+        local menu_items = {}
+        if #items >= 2 then
+            menu_items[#menu_items + 1] = {
+                text     = string.format(_("Install all %d patches\u{2026}"), #items),
+                bold     = true,
+                callback = function() self:confirmInstallAllPatches(items) end,
+            }
+        end
+        for _i, it in ipairs(items) do
+            it._installed = installed[it.name]
+            local pref = it
+            local status
+            if it._installed then
+                status = it._installed.disabled and _("Installed [DISABLED]") or _("Installed")
+                local link = self:getPatchInstall(it.name)
+                if link and link.sha and link.sha ~= it.sha then
+                    status = status .. " " .. _("(update)")
+                end
+            end
+            menu_items[#menu_items + 1] = {
+                text      = it.name,
+                mandatory = status,
+                bold      = status ~= nil,
+                callback  = function() self:showDiscoveredPatchDialog(pref) end,
+            }
+        end
+
+        local menu_instance
+        menu_instance = Menu:new{
+            title      = repo.full_name,
+            subtitle   = json_str(repo.description) ~= "" and repo.description or nil,
+            item_table = menu_items,
+            width      = Screen:getWidth(),
+            height     = Screen:getHeight(),
+        }
+        function menu_instance:onMenuChoice(item)
+            UIManager:close(self)
+            if item.callback then item.callback() end
+        end
+        UIManager:show(menu_instance)
+    end)
+end
+
+function PluginManager:showDiscoverPatchesDialog()
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    if ok and NetworkMgr then
+        NetworkMgr:runWhenOnline(function() self:_showDiscoverPatchesDialog(1, {}) end)
+    else
+        self:_showDiscoverPatchesDialog(1, {})
+    end
+end
+
+function PluginManager:_showDiscoverPatchesDialog(page, accumulated)
+    local notice = InfoMessage:new{ text = _("Searching GitHub\u{2026}") }
+    UIManager:show(notice)
+    UIManager:scheduleIn(0.2, function()
+        UIManager:close(notice)
+        local results, err, total_count, has_more = self:searchGithubPatchRepos{
+            text = self._discover_patches_filter,
+            sort = self:getDiscoverPatchesSort(),
+            page = page,
+        }
+        if not results then
+            UIManager:show(InfoMessage:new{
+                text    = _("Search failed:") .. "\n" .. (err or "?"),
+                timeout = 5,
+            })
+            return
+        end
+        for _, r in ipairs(results) do accumulated[#accumulated + 1] = r end
+
+        if #accumulated == 0 then
+            if self._discover_patches_filter then
+                UIManager:show(ConfirmBox:new{
+                    text        = string.format(
+                        _("No results for \u{201c}%s\u{201d} (%d repositories are candidates in total, before that filter).\nClear the filter and search again?"),
+                        self._discover_patches_filter, total_count or 0
+                    ),
+                    ok_text     = _("Clear filter"),
+                    ok_callback = function()
+                        self._discover_patches_filter = nil
+                        self:showDiscoverPatchesDialog()
+                    end,
+                    cancel_text = _("Close"),
+                })
+            else
+                UIManager:show(InfoMessage:new{ text = _("No results."), timeout = 3 })
+            end
+            return
+        end
+
+        local Menu   = require("ui/widget/menu")
+        local Screen = require("device").screen
+
+        local items = {}
+        for _i, repo in ipairs(accumulated) do
+            local pref = repo
+            items[#items + 1] = {
+                text      = repo.full_name,
+                mandatory = string.format("\u{2605}%d", repo.stars),
+                callback  = function() self:showPatchRepoDialog(pref) end,
+            }
+        end
+        if has_more then
+            items[#items + 1] = {
+                text     = _("Load more\u{2026}"),
+                callback = function() self:_showDiscoverPatchesDialog(page + 1, accumulated) end,
+            }
+        end
+
+        local menu_instance
+        menu_instance = Menu:new{
+            title               = _("Discover patches"),
+            subtitle            = self._discover_patches_filter and string.format(_("Search: %s"), self._discover_patches_filter) or nil,
+            item_table          = items,
+            width               = Screen:getWidth(),
+            height              = Screen:getHeight(),
+            title_bar_left_icon = "appbar.search",
+            onLeftButtonTap     = function()
+                UIManager:close(menu_instance)
+                self:showDiscoverPatchesFilterDialog()
+            end,
+            onLeftButtonHold    = function()
+                local mode = self:cycleDiscoverPatchesSort()
+                UIManager:close(menu_instance)
+                UIManager:show(InfoMessage:new{
+                    text    = mode == "updated" and _("Sorted by last updated.") or _("Sorted by stars."),
+                    timeout = 2,
+                })
+                self:showDiscoverPatchesDialog()
+            end,
+        }
+        function menu_instance:onMenuChoice(item)
+            UIManager:close(self)
+            if item.callback then item.callback() end
+        end
+        UIManager:show(menu_instance)
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Patches: installed list + per-patch dialog
+-- ---------------------------------------------------------------------------
+
+function PluginManager:showInstalledPatchDialog(iref)
+    local link = self:getPatchInstall(iref.name)
+    local dlg
+    local buttons = {}
+
+    if link then
+        buttons[#buttons + 1] = {{
+            text     = _("Check for update"),
+            callback = function()
+                UIManager:close(dlg)
+                self:checkPatchUpdate(iref.name, link)
+            end,
+        }}
+        buttons[#buttons + 1] = {{
+            text     = _("Reinstall"),
+            callback = function()
+                UIManager:close(dlg)
+                self:_doInstallPatch(patch_item_from_link(iref.name, link))
+            end,
+        }}
+        buttons[#buttons + 1] = {{
+            text     = _("README\u{2026}"),
+            callback = function()
+                UIManager:close(dlg)
+                self:showReadme(
+                    github_raw_base_url(link.owner, link.name) .. "README.md",
+                    string.format(_("README: %s"), link.full_name),
+                    link.owner .. "_" .. link.name
+                )
+            end,
+        }}
+        buttons[#buttons + 1] = {{
+            text     = _("Unlink"),
+            callback = function()
+                UIManager:close(dlg)
+                self:forgetPatchInstall(iref.name)
+                self:showInstalledPatchDialog(iref)
+            end,
+        }}
+    end
+
+    buttons[#buttons + 1] = {{
+        text     = iref.disabled and _("Enable") or _("Disable"),
+        callback = function()
+            UIManager:close(dlg)
+            self:setPatchDisabled(iref.name, not iref.disabled)
+            UIManager:show(InfoMessage:new{
+                text    = iref.disabled
+                    and string.format(_("%s enabled.\nRestart KOReader to apply."), iref.name)
+                    or  string.format(_("%s disabled.\nRestart KOReader to apply."), iref.name),
+                timeout = 5,
+            })
+        end,
+    }}
+
+    buttons[#buttons + 1] = {{
+        text     = _("Remove"),
+        callback = function()
+            UIManager:close(dlg)
+            UIManager:show(ConfirmBox:new{
+                text        = string.format(_("Remove %s?"), iref.name),
+                ok_text     = _("Remove"),
+                ok_callback = function()
+                    os.remove(_patches_dir .. "/" .. iref.file)
+                    self:forgetPatchInstall(iref.name)
+                    UIManager:show(InfoMessage:new{
+                        text    = string.format(_("%s removed."), iref.name),
+                        timeout = 5,
+                    })
+                end,
+            })
+        end,
+    }}
+
+    buttons[#buttons + 1] = {{
+        text     = _("Cancel"),
+        callback = function() UIManager:close(dlg) end,
+    }}
+
+    local title = iref.name
+    if iref.disabled then title = title .. "  " .. _("[DISABLED]") end
+    if link then title = title .. "\n" .. link.full_name end
+    dlg = ButtonDialog:new{ title = title, buttons = buttons }
+    UIManager:show(dlg)
+end
+
+function PluginManager:showInstalledPatchesList()
+    local Menu      = require("ui/widget/menu")
+    local Screen    = require("device").screen
+    local installed = self:scanInstalledPatches()
+
+    local items = {}
+    for _name, inst in pairs(installed) do
+        local iref = inst
+        local tag  = self:getPatchInstall(iref.name) and _("(GitHub)") or _("(local)")
+        items[#items + 1] = {
+            text      = (iref.disabled and (_("[DISABLED]") .. " ") or "") .. iref.name,
+            mandatory = tag,
+            callback  = function() self:showInstalledPatchDialog(iref) end,
+        }
+    end
+
+    if #items == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No patches installed."), timeout = 3 })
+        return
+    end
+
+    table.sort(items, function(a, b) return a.text < b.text end)
+
+    local menu_instance
+    menu_instance = Menu:new{
+        title      = _("Installed patches"),
+        item_table = items,
+        width      = Screen:getWidth(),
+        height     = Screen:getHeight(),
+    }
+    function menu_instance:onMenuChoice(item)
+        UIManager:close(self)
+        if item.callback then item.callback() end
+    end
+    UIManager:show(menu_instance)
+end
+
+-- ---------------------------------------------------------------------------
+-- Patches: main dialog
+-- ---------------------------------------------------------------------------
+
+function PluginManager:showPatchesMainDialog()
+    local dlg
+    local ok_up, userpatch = pcall(require, "userpatch")
+    local all_disabled = ok_up and userpatch.arePatchesDisabled and userpatch.arePatchesDisabled()
+    local title = _("Patches")
+    if ok_up then
+        title = title .. "\n" .. (all_disabled and _("All patches: OFF") or _("All patches: ON"))
+    end
+
+    local buttons = {}
+    buttons[#buttons + 1] = {{
+        text     = _("Installed patches"),
+        callback = function()
+            UIManager:close(dlg)
+            self:showInstalledPatchesList()
+        end,
+    }}
+    buttons[#buttons + 1] = {{
+        text     = _("Discover patches\u{2026}"),
+        callback = function()
+            UIManager:close(dlg)
+            self:showDiscoverPatchesDialog()
+        end,
+    }}
+    if ok_up and userpatch.togglePatchesDisabled then
+        buttons[#buttons + 1] = {{
+            text     = all_disabled and _("Enable all patches") or _("Disable all patches"),
+            callback = function()
+                UIManager:close(dlg)
+                userpatch.togglePatchesDisabled()
+                UIManager:show(InfoMessage:new{
+                    text    = all_disabled
+                        and _("All patches enabled.\nRestart KOReader to apply.")
+                        or  _("All patches disabled.\nRestart KOReader to apply."),
+                    timeout = 5,
+                })
+            end,
+        }}
+    end
+    buttons[#buttons + 1] = {{
+        text     = _("Close"),
+        callback = function() UIManager:close(dlg) end,
+    }}
+
+    dlg = ButtonDialog:new{ title = title, buttons = buttons }
+    UIManager:show(dlg)
+end
+
+-- ---------------------------------------------------------------------------
 -- Main dialog
 -- ---------------------------------------------------------------------------
 
@@ -2528,6 +3268,13 @@ function PluginManager:showMainDialog()
                 callback = function()
                     UIManager:close(dlg)
                     self:showDiscoverDialog()
+                end,
+            }},
+            {{
+                text     = _("Patches\u{2026}"),
+                callback = function()
+                    UIManager:close(dlg)
+                    self:showPatchesMainDialog()
                 end,
             }},
             {{
