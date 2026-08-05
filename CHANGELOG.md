@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-08-05
+
+### Added
+- **Patches…**: manage KOReader user patches (`koreader/patches/`) the same
+  way this plugin already manages `.koplugin` plugins, mirroring what
+  appstore.koplugin offers. Discover patch repositories on GitHub (topic
+  `koreader-user-patch`, merged with a name/description fallback search,
+  same strategy as Discover plugins), browse and install individual patch
+  files or a whole repository's worth at once, then track installs with
+  Check for update/Reinstall/README/Unlink and per-patch Disable/Enable
+  (renames to `<name>.lua.disabled`, which KOReader's own loader skips).
+  Since patches carry no version metadata, updates are detected by comparing
+  the file's GitHub blob SHA against the one recorded at install time.
+  A new "Enable/Disable all patches" toggle controls KOReader's own global
+  patch switch independently of individual patch state.
+
 ## [1.2.4] - 2026-08-04
 
 ### Added

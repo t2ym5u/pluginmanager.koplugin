@@ -15,6 +15,7 @@ A plugin manager for [KOReader](https://github.com/koreader/koreader) that lets 
 - **Ignore a version** — hide one specific update until a newer version is released
 - **Search & sort** — filter the plugin list by name, or sort by name/status (tap the magnifier to filter, hold it to change sort)
 - **Discover plugins** — search GitHub for third-party KOReader plugins (tagged `koreader-plugin`) and install them directly, outside the koreader-plugins repository
+- **Patches** — discover, install, update, disable/enable, and remove KOReader user patches (`koreader/patches/`) from GitHub, the same way appstore.koplugin does
 
 ## Installation
 
@@ -82,6 +83,37 @@ This topic is self-tagged by repo owners and plenty of real plugins never set it
 - Only install repositories you trust: this downloads and runs arbitrary third-party code.
 
 GitHub's search API has a very low unauthenticated rate limit (10 requests/minute), and every non-`user:` search or "Load more" tap uses **two** of those requests (topic search + name search); the general API used for `user:NAME` browsing and for every install is more generous (60/hour) but still easy to exceed with many installs back to back. If you hit either, see **Configuration** below.
+
+## Patches
+
+**Patches…** in the main dialog manages KOReader user patches — numbered `*.lua`
+files in `koreader/patches/` that KOReader applies at startup (see
+`frontend/userpatch.lua` in the main koreader checkout) — the same way the rest
+of this plugin manages `.koplugin` plugins, and the same feature
+[appstore.koplugin](https://github.com/omer-faruq/appstore.koplugin) offers.
+
+- **Discover patches…** searches GitHub for repositories tagged
+  `koreader-user-patch`, merged with a name/description fallback search (same
+  two-query strategy as Discover plugins), since plenty of real patch
+  repositories never set that topic either. Tapping a repository lists every
+  patch file it contains — read from its root, or from a top-level `patches/`
+  subfolder if it has one (both conventions exist in the wild) — with
+  **Install**, **README…**, or **Install all N patches…** for the whole
+  repository at once.
+- **Installed patches** lists everything currently in `patches/`, tagged
+  `(GitHub)` if it was installed from here (enabling **Check for
+  update**/**Reinstall**/README/**Unlink**) or `(local)` otherwise.
+  **Disable**/**Enable** renames the file to/from `<name>.lua.disabled` —
+  KOReader's loader still matches the numbered prefix but skips anything not
+  ending in `.lua`, so the patch stops running without being deleted.
+- Patches carry no version metadata, so update checks compare the file's
+  GitHub blob SHA against the one recorded at install time, rather than a
+  version number.
+- **Enable/Disable all patches** toggles KOReader's own global patch switch
+  (the same one behind `patches/.patches_disabled`), independent of any
+  individual patch's own enabled state.
+- As with Discover plugins, only install patches from sources you trust: a
+  patch is arbitrary Lua code that runs with full access to KOReader.
 
 ## Configuration (optional GitHub token)
 
