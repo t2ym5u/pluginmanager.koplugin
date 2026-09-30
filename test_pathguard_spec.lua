@@ -107,3 +107,99 @@ describe("PathGuard.shellQuote", function()
         assert.are.equal("'/a/x; rm -rf ~'", q)
     end)
 end)
+
+describe("PathGuard.filePath", function()
+    -- These entries name a file to write: one from manifest.json's `files`,
+    -- one from inside a downloaded zip. Both are chosen by whoever produced
+    -- the manifest or the archive, not by this plugin.
+    local ROOT = "/mnt/plugins/sudoku.koplugin"
+
+    it("builds the path for an ordinary file", function()
+        assert.are.equal(ROOT .. "/main.lua", PathGuard.filePath(ROOT, "main.lua"))
+    end)
+
+    it("allows a subdirectory, which is why isSafeName is not used here", function()
+        -- Real entries look like this; a plugin directory name may not.
+        assert.are.equal(ROOT .. "/common/i18n.lua",
+            PathGuard.filePath(ROOT, "common/i18n.lua"))
+        assert.are.equal(ROOT .. "/a/b/c/d.lua",
+            PathGuard.filePath(ROOT, "a/b/c/d.lua"))
+    end)
+
+    it("refuses an entry that climbs out of the plugin directory", function()
+        -- Zip Slip: inside an archive this is how a file lands in someone
+        -- else's directory, or over KOReader's own settings.
+        assert.is_nil(PathGuard.filePath(ROOT, "../evil.lua"))
+        assert.is_nil(PathGuard.filePath(ROOT, "../../evil.lua"))
+        assert.is_nil(PathGuard.filePath(ROOT, "../../../../../../etc/passwd"))
+    end)
+
+    it("refuses a climb hidden in the middle of the path", function()
+        -- The entry looks well-behaved until it is walked.
+        assert.is_nil(PathGuard.filePath(ROOT, "common/../../evil.lua"))
+        assert.is_nil(PathGuard.filePath(ROOT, "a/b/../../../evil.lua"))
+    end)
+
+    it("refuses a climb at the very end", function()
+        assert.is_nil(PathGuard.filePath(ROOT, "common/.."))
+        assert.is_nil(PathGuard.filePath(ROOT, ".."))
+    end)
+
+    it("allows a name that merely begins with dots", function()
+        -- "..foo" walks nowhere; only the "." and ".." segments do.
+        assert.are.equal(ROOT .. "/..foo.lua", PathGuard.filePath(ROOT, "..foo.lua"))
+        assert.are.equal(ROOT .. "/.version", PathGuard.filePath(ROOT, ".version"))
+    end)
+
+    it("refuses an absolute entry, which is not a relative path at all", function()
+        assert.is_nil(PathGuard.filePath(ROOT, "/etc/passwd"))
+        assert.is_nil(PathGuard.filePath(ROOT, "/"))
+    end)
+
+    it("refuses a backslash, which two hosts would read differently", function()
+        -- A separator on one system, a literal character here: the two
+        -- readings disagree about where the file lands.
+        assert.is_nil(PathGuard.filePath(ROOT, "..\\evil.lua"))
+        assert.is_nil(PathGuard.filePath(ROOT, "common\\i18n.lua"))
+    end)
+
+    it("refuses an entry naming a directory rather than a file", function()
+        assert.is_nil(PathGuard.filePath(ROOT, "common/"))
+        assert.is_nil(PathGuard.filePath(ROOT, ""))
+    end)
+
+    it("refuses a null byte, which truncates the path for whatever opens it", function()
+        assert.is_nil(PathGuard.filePath(ROOT, "main.lua\0/../../evil.lua"))
+    end)
+
+    it("refuses an absurdly long entry rather than passing it on", function()
+        assert.is_nil(PathGuard.filePath(ROOT, string.rep("a", 1025)))
+        assert.is_truthy(PathGuard.filePath(ROOT, string.rep("a", 1024)))
+    end)
+
+    it("refuses non-string input rather than guessing", function()
+        assert.is_nil(PathGuard.filePath(ROOT, nil))
+        assert.is_nil(PathGuard.filePath(ROOT, 42))
+        assert.is_nil(PathGuard.filePath(nil, "main.lua"))
+    end)
+
+    it("tolerates a trailing slash on the root", function()
+        assert.are.equal(ROOT .. "/main.lua", PathGuard.filePath(ROOT .. "/", "main.lua"))
+    end)
+
+    it("agrees with isWithin on everything it returns", function()
+        -- filePath is only trustworthy if it never hands back a path isWithin
+        -- would have refused, so the two are checked against each other.
+        local entries = {
+            "main.lua", "common/i18n.lua", "a/b/c.lua", "..foo.lua", ".version",
+            "../evil.lua", "common/../../evil.lua", "/etc/passwd", "..", "",
+        }
+        for _, rel in ipairs(entries) do
+            local path = PathGuard.filePath(ROOT, rel)
+            if path then
+                assert.is_true(PathGuard.isWithin(ROOT, path),
+                    "filePath returned a path isWithin refuses: " .. rel)
+            end
+        end
+    end)
+end)

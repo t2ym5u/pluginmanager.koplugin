@@ -110,6 +110,8 @@ return {
     ["No _meta.lua found in this repository's archive."] = { fr = "Aucun _meta.lua trouvé dans l'archive de ce dépôt.", es = "No se encontró _meta.lua en el archivo de este repositorio.", de = "Keine _meta.lua im Archiv dieses Repositorys gefunden." },
     ["Could not detect a plugin inside this repository."] = { fr = "Impossible de détecter un plugin dans ce dépôt.", es = "No se pudo detectar un plugin en este repositorio.", de = "In diesem Repository konnte kein Plugin erkannt werden." },
     ["Failed to extract %s"]      = { fr = "Échec de l'extraction de %s", es = "Error al extraer %s", de = "Fehler beim Extrahieren von %s" },
+    ["Refused file entry: %s"]    = { fr = "Entrée de fichier refusée : %s", es = "Entrada de archivo rechazada: %s", de = "Dateieintrag abgelehnt: %s" },
+    ["Refused archive entry: %s"] = { fr = "Entrée d'archive refusée : %s", es = "Entrada de archivo comprimido rechazada: %s", de = "Archiveintrag abgelehnt: %s" },
     ["Installation failed:"]      = { fr = "Échec de l'installation :", es = "Error de instalación:", de = "Installation fehlgeschlagen:" },
     ["%s installed.\nPlease restart KOReader to load it."] = { fr = "%s installé.\nRedémarrez KOReader pour le charger.", es = "%s instalado.\nReinicie KOReader para cargarlo.", de = "%s installiert.\nStarten Sie KOReader neu, um es zu laden." },
 
