@@ -514,6 +514,8 @@ end
 -- Filesystem helpers
 -- ---------------------------------------------------------------------------
 
+local PathGuard = lrequire("pathguard")
+
 local function get_lfs()
     local ok, lfs = pcall(require, "libs/libkoreader-lfs")
     if not ok then ok, lfs = pcall(require, "lfs") end
@@ -564,8 +566,15 @@ local function write_file(path, content)
     return true
 end
 
+-- Deletes a path, but only one that sits strictly inside the plugins
+-- directory. The previous guard was `path:find(_plugins_dir, 1, true)`, a
+-- SUBSTRING test: it also let through any sibling whose name merely began
+-- with the plugins directory -- "plugins-backup", "plugins_old" -- and said
+-- nothing about "..", although the paths it protects are built from
+-- manifest.json's `dir` field, which arrives over the network. See
+-- pathguard.lua and its spec.
 local function rm_rf(path)
-    if not path:find(_plugins_dir, 1, true) then return end
+    if not PathGuard.isWithin(_plugins_dir, path) then return end
     local lfs = get_lfs()
     if lfs then
         local mode = lfs.attributes(path, "mode")
@@ -578,7 +587,9 @@ local function rm_rf(path)
             os.remove(path)
         end
     else
-        os.execute("rm -rf " .. path)
+        -- Quoted: an unquoted path with a space in it would hand `rm -rf`
+        -- two targets instead of one.
+        os.execute("rm -rf " .. PathGuard.shellQuote(path))
     end
 end
 
@@ -1424,7 +1435,17 @@ end
 -- ---------------------------------------------------------------------------
 
 function PluginManager:_doRemove(fullname, plugin_dir)
-    rm_rf(_plugins_dir .. "/" .. plugin_dir)
+    -- Validate the name before building a path out of it, rather than relying
+    -- on rm_rf to catch it afterwards.
+    local target = PathGuard.pluginPath(_plugins_dir, plugin_dir)
+    if not target then
+        UIManager:show(InfoMessage:new{
+            text    = string.format(_("Refused to remove %s: unsafe directory name."), fullname),
+            timeout = 5,
+        })
+        return
+    end
+    rm_rf(target)
     local id = plugin_dir:match("^(.*)%.koplugin$")
     if id then self:forgetDiscoverInstall(id) end
     UIManager:show(InfoMessage:new{
@@ -1453,7 +1474,8 @@ function PluginManager:_cleanupRenamed(manifest)
             for _, old_id in ipairs(p.renamed_from) do
                 local old = installed[old_id]
                 if old and old.dir ~= installed[p.id].dir then
-                    rm_rf(_plugins_dir .. "/" .. old.dir)
+                    local old_path = PathGuard.pluginPath(_plugins_dir, old.dir)
+                    if old_path then rm_rf(old_path) end
                     removed[#removed + 1] = old.fullname
                 end
             end
@@ -2431,7 +2453,8 @@ function PluginManager:_doRemoveAll()
                 return
             end
             local inst = to_remove[i]
-            rm_rf(_plugins_dir .. "/" .. inst.dir)
+            local inst_path = PathGuard.pluginPath(_plugins_dir, inst.dir)
+            if inst_path then rm_rf(inst_path) end
             UIManager:scheduleIn(0, function() step(i + 1) end)
         end
         step(1)

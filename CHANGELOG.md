@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+
+## [1.4.0] - 2026-09-30
+
+### Fixed
+- **Tightened what this plugin is allowed to delete.** The guard around
+  `rm_rf` was `path:find(_plugins_dir, 1, true)` — a *substring* test, not a
+  prefix one. It therefore also let through any sibling directory whose name
+  merely began with the plugins directory (`plugins-backup`, `plugins_old`,
+  `plugins.bak`) and any path that happened to contain it further along. It is
+  now an anchored prefix test against the plugins directory with a trailing
+  separator, and the directory itself is no longer a deletable target.
+- Paths containing a `..` segment are refused outright. They are built from
+  `manifest.json`'s `dir` field, which arrives over the network, and were not
+  checked for it.
+- The directory name is now validated where the path is built, not only where
+  it is deleted: a name that is not one plain path segment is refused and the
+  removal is reported as declined rather than silently doing nothing.
+- The no-`lfs` fallback ran `os.execute("rm -rf " .. path)` with the path
+  unquoted, so one containing a space would have handed `rm -rf` two targets
+  instead of one. It is single-quoted now.
+
+### Added
+- `pathguard.lua`, holding that logic on its own with no KOReader dependency,
+  and `test_pathguard_spec.lua` covering it — 15 cases including every sibling
+  and `..` shape above. This plugin is the only one in the collection that can
+  destroy a user's files and it had no tests at all.
+
 ## [1.3.0] - 2026-08-05
 
 ### Added
