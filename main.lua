@@ -537,7 +537,7 @@ local function mkdir_p(path)
             end
         end
     else
-        os.execute("mkdir -p " .. path)
+        os.execute("mkdir -p " .. PathGuard.shellQuote(path))
     end
 end
 
@@ -756,11 +756,15 @@ function PluginManager:ensureCommon(manifest, lib_key)
         if not body then
             return false, string.format("%s/%s: %s", spec.dir, fname, err)
         end
-        local subdir = fname:match("^(.*)/[^/]+$")
-        if subdir then
-            mkdir_p(lib_dir .. "/" .. subdir)
+        -- fname comes straight out of manifest.json, so it is checked
+        -- before it becomes a path, the same way `dir` already is.
+        local dest = PathGuard.filePath(lib_dir, fname)
+        if not dest then
+            return false, string.format("%s: refused file entry %q", spec.dir, tostring(fname))
         end
-        write_file(lib_dir .. "/" .. fname, body)
+        local subdir = dest:match("^(.*)/[^/]+$")
+        if subdir then mkdir_p(subdir) end
+        write_file(dest, body)
     end
     write_file(lib_dir .. "/.version", spec.version)
     return true
@@ -775,11 +779,13 @@ function PluginManager:installPlugin(plugin_info, manifest)
         if not body then
             return false, string.format(_("Download failed: %s \u{2014} %s"), fname, err)
         end
-        local subdir = fname:match("^(.*)/[^/]+$")
-        if subdir then
-            mkdir_p(plugin_dir .. "/" .. subdir)
+        local dest = PathGuard.filePath(plugin_dir, fname)
+        if not dest then
+            return false, string.format(_("Refused file entry: %s"), tostring(fname))
         end
-        local ok, werr = write_file(plugin_dir .. "/" .. fname, body)
+        local subdir = dest:match("^(.*)/[^/]+$")
+        if subdir then mkdir_p(subdir) end
+        local ok, werr = write_file(dest, body)
         if not ok then
             return false, string.format(_("Write failed: %s \u{2014} %s"), fname, werr)
         end
@@ -916,9 +922,14 @@ local function extract_archive(reader, plugin_root, dest_dir)
     for entry in reader:iterate() do
         if entry.mode == "file" and entry.path:sub(1, #prefix) == prefix then
             local relative = entry.path:sub(#prefix + 1)
-            local dest_path = dest_dir .. "/" .. relative
-            local subdir = relative:match("^(.*)/[^/]+$")
-            if subdir then mkdir_p(dest_dir .. "/" .. subdir) end
+            -- The archive names its own entries, so "plugin/../../x" would
+            -- pass the prefix test above and still land outside dest_dir.
+            local dest_path = PathGuard.filePath(dest_dir, relative)
+            if not dest_path then
+                return false, string.format(_("Refused archive entry: %s"), relative)
+            end
+            local subdir = dest_path:match("^(.*)/[^/]+$")
+            if subdir then mkdir_p(subdir) end
             if not reader:extractToPath(entry.path, dest_path) then
                 return false, string.format(_("Failed to extract %s"), relative)
             end
