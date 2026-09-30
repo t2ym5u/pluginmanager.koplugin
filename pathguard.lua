@@ -64,6 +64,34 @@ function PathGuard.pluginPath(root, name)
     return path
 end
 
+-- The full path of a file that some outside source says belongs inside `root`
+-- -- an entry in manifest.json's `files`, or a path inside a downloaded zip.
+-- Returns nil when the entry cannot be trusted.
+--
+-- isSafeName is too strict here: these entries legitimately carry a
+-- subdirectory ("common/i18n.lua"). What they must not do is leave `root`,
+-- which is exactly what isWithin decides, so the check is: build the path,
+-- then refuse it unless it landed inside.
+--
+-- Without this, an entry of "../../evil.lua" writes wherever it likes. For an
+-- archive that is the Zip Slip vulnerability; for manifest.json it is the same
+-- hole the `dir` field was already guarded against.
+function PathGuard.filePath(root, rel)
+    if type(root) ~= "string" or type(rel) ~= "string" then return nil end
+    if rel == "" or #rel > 1024 then return nil end
+    if rel:find("%z") then return nil end
+    -- Must be relative, and must name a file rather than a directory.
+    if rel:sub(1, 1) == "/" then return nil end
+    if rel:sub(-1) == "/" then return nil end
+    -- Backslashes would be a separator on some hosts and a literal character
+    -- here, so the two readings could disagree about where the file lands.
+    if rel:find("\\", 1, true) then return nil end
+
+    local path = root:gsub("/+$", "") .. "/" .. rel
+    if not PathGuard.isWithin(root, path) then return nil end
+    return path
+end
+
 -- Single-quoted for the shell, with embedded quotes closed and reopened.
 -- Only used on the no-lfs fallback path, where deletion goes through
 -- `rm -rf`: an unquoted path containing a space would delete the wrong thing.
