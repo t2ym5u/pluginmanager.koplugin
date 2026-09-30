@@ -3,6 +3,29 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.4.1] - 2026-09-30
+
+### Fixed
+- Guard the file paths that come from `manifest.json`'s `files` field and from
+  a downloaded archive. `pathguard.lua` was written for the `dir` field, whose
+  paths arrive over the network; the same reasoning had never been applied to
+  these three sites, which built a write path out of a string chosen
+  elsewhere. An entry of `../../evil.lua` wrote wherever it liked -- for the
+  archive that is Zip Slip, and the prefix test already there protects nothing
+  against it, since `myplugin/../../evil.lua` does start with `myplugin/`.
+- Quote the `mkdir -p` fallback. `shellQuote` was called for the neighbouring
+  `rm -rf` and missed here -- same file, same no-lfs branch, same source.
+
+None of this was remotely triggerable: the manifest is served from the
+project's own GitHub repository over HTTPS. These were missing guards, not
+open holes.
+
+### Added
+- `PathGuard.filePath(root, rel)`, which builds the path and refuses it unless
+  it landed inside `root`. The spec goes from 15 cases to 29; the last checks
+  that `filePath` never returns a path `isWithin` would refuse, so the two
+  guards cannot drift apart.
+
 ## [1.4.0] - 2026-09-30
 
 ### Fixed

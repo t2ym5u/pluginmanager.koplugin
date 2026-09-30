@@ -65,6 +65,12 @@ The plugin manager downloads a `manifest.json` file from the repository root. Th
 
 Two shared libraries exist for plugins that vendor common code instead of duplicating it: `game-common` (ScreenBase-based games) and `sudoku-common` (BaseScreen-based sudoku variants — a different, incompatible API). A plugin's `common_lib` field in `manifest.json` names which one it needs. The named library is downloaded automatically the first time any plugin that depends on it is installed, and copied into that plugin's `common/` folder (a real copy, never a symlink, so it survives on any device); it's refreshed on every install/update to guarantee it's never stale.
 
+Every path written during an install is checked before it is opened: a file
+listed in `manifest.json`, or an entry inside a downloaded archive, names where
+it wants to land, and one naming a place outside the plugin's own directory is
+refused rather than written. The same check covers deletion, so a plugin entry
+can neither escape the plugins folder nor remove anything beside it.
+
 Files are fetched with a short pacing delay between requests, and a 429 (rate limit) from `raw.githubusercontent.com` is retried with backoff rather than failing the whole update — useful during a bulk Update/Reinstall run that touches every installed plugin.
 
 ## Discover plugins (third-party repos)
