@@ -42,18 +42,40 @@ jobs:
           repository: t2ym5u/game-common
           path: _game_common
 
+      - name: Checkout sudoku-common
+        if: steps.check.outputs.release_exists == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: t2ym5u/sudoku-common
+          path: _sudoku_common
+
       - name: Build ZIP
         if: steps.check.outputs.release_exists == 'false'
         run: |
           PLUGIN="${GITHUB_REPOSITORY##*/}"
           PLUGIN_DIR="/tmp/${PLUGIN}"
           mkdir -p "${PLUGIN_DIR}/common"
-          rsync -a --exclude='.git' --exclude='.github' --exclude='common' --exclude='_game_common' \
+          rsync -a --exclude='.git' --exclude='.github' --exclude='common' \
+            --exclude='_game_common' --exclude='_sudoku_common' \
+            --exclude='test_*.lua' --exclude='.busted' \
             . "${PLUGIN_DIR}/"
-          if [ -f "common/base_board.lua" ]; then
+          # common/ is a committed symlink naming the shared library this
+          # plugin uses. It dangles in an isolated checkout, so resolve it by
+          # name -- never by testing for a file *through* it. That test
+          # ("is common/base_board.lua readable?") failed for every sudoku
+          # variant and silently fell through to game-common, producing a zip
+          # whose require("common/base_board_widget") could not resolve.
+          LIB="$(readlink common 2>/dev/null || true)"
+          case "${LIB##*/}" in
+            sudoku-common) SRC=_sudoku_common ;;
+            game-common)   SRC=_game_common ;;
+            *)             SRC="" ;;
+          esac
+          if [ -n "$SRC" ]; then
+            rsync -a --exclude='.git' --exclude='.github' "$SRC/" "${PLUGIN_DIR}/common/"
+          elif [ -d common ]; then
+            # A plugin that vendors its own diverged copy, not a symlink.
             cp common/*.lua "${PLUGIN_DIR}/common/"
-          else
-            rsync -a --exclude='.git' _game_common/ "${PLUGIN_DIR}/common/"
           fi
           cd /tmp
           zip -r "${PLUGIN}.zip" "${PLUGIN}/"
