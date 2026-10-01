@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.4.2] - 2026-10-01
+
+### Fixed
+- KOReader offered no way to delete this plugin's settings. The settings path
+  was computed inline rather than stored on the instance, and `PluginLoader`
+  reads `instance.settings_file` to decide whether to show "Delete plugin
+  settings" at all (2026.07, PR #15240). The option simply never appeared, and
+  deleting the plugin left ``pluginmanager.lua`` behind.
+  `init()` now resolves it too: it was only reached on the first `getSetting()`,
+  which is later than KOReader builds the plugin dialog.
+
 ## [1.4.1] - 2026-09-30
 
 ### Fixed
