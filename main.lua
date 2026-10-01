@@ -78,10 +78,16 @@ local PluginManager = WidgetContainer:extend{
 -- ---------------------------------------------------------------------------
 
 function PluginManager:ensureSettings()
+    -- settings_file must be a field, not a local. KOReader's PluginLoader
+    -- reads instance.settings_file to decide whether to offer "Delete plugin
+    -- settings", and removes the file itself (2026.07, PR #15240). Compute
+    -- the path inline and the option never appears at all, leaving the file
+    -- behind when the plugin is deleted.
+    if not self.settings_file then
+        self.settings_file = DataStorage:getSettingsDir() .. "/pluginmanager.lua"
+    end
     if not self.settings then
-        self.settings = LuaSettings:open(
-            DataStorage:getSettingsDir() .. "/pluginmanager.lua"
-        )
+        self.settings = LuaSettings:open(self.settings_file)
     end
 end
 
@@ -3332,6 +3338,10 @@ end
 -- ---------------------------------------------------------------------------
 
 function PluginManager:init()
+    -- Resolves settings_file, which KOReader reads off the instance to
+    -- offer "Delete plugin settings" -- it must exist before the plugin
+    -- dialog is built, not merely on first getSetting().
+    self:ensureSettings()
     self.ui.menu:registerToMainMenu(self)
     self:loadCachedManifest()
 
