@@ -19,9 +19,13 @@ local LuaSettings     = require("luasettings")
 local UIManager       = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger          = require("logger")
-local _               = require("i18n")
+local _               = lrequire("i18n")
 
-require("i18n").extend(lrequire("i18n_fr"))
+-- lrequire, not require: package.loaded["i18n"] is a single slot shared by
+-- every plugin on the device and the first one loaded wins it. This plugin
+-- is standalone (no common/), so it must not take that slot from the game
+-- plugins, nor merge its own strings into their shared table.
+lrequire("i18n").extend(lrequire("i18n_fr"))
 
 local MANIFEST_URL   = "https://raw.githubusercontent.com/t2ym5u/koreader-plugins/master/manifest.json"
 local AUTO_CHECK_TTL = 86400  -- re-check automatically at most once every 24 h
