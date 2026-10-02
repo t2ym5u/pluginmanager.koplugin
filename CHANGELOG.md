@@ -3,6 +3,19 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.4.3] - 2026-10-02
+
+### Fixed
+- `require("i18n")` -> `lrequire("i18n")`. `package.loaded` is keyed by module
+  name alone, so every `require("i18n")` on the device resolves to one module
+  and the first plugin loaded wins it. Every plugin's `i18n_fr.lua` merges
+  into that one shared table, where plugins silently overwrite each other's
+  translations. This plugin is standalone -- no `common/`, and its strings are
+  its own -- so it had no business taking that slot or merging into the game
+  plugins' table, where its `Clear` ("Effacer") was overwriting theirs
+  ("Effacer tout"), already the translation of `Erase`, leaving two identical
+  buttons in every game.
+
 ## [1.4.2] - 2026-10-01
 
 ### Fixed
