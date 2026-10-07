@@ -3,5 +3,5 @@ local _ = require("gettext")
 return {
     fullname    = _("Plugin Manager"),
     description = _("Check for updates and install game plugins from the koreader-plugins repository."),
-    version     = "1.4.3",
+    version     = "1.4.4",
 }
