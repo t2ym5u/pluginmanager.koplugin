@@ -3,6 +3,25 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.4.5] - 2026-10-07
+
+### Fixed
+- Reinstall All now really re-downloads the shared libraries, as its prompt
+  has always promised. `ensureCommon()` short-circuited on the bundle's
+  `.version` stamp, which records a version and not integrity: a
+  `game-common`/`sudoku-common` truncated by a mid-write crash or a
+  half-finished run kept a perfectly current stamp and was skipped by the one
+  action whose purpose is to fetch everything again. `installPlugin()` then
+  copied that stale bundle into every consuming plugin's `common/`, so
+  Reinstall All propagated the damage instead of repairing it. The gate is
+  kept for Update, which has nothing to re-download.
+
+### Added
+- `test_bulk_install_spec.lua`: drives the real `_doFullUpdate` /
+  `_doFullReinstall` against a sandbox plugins/ tree and a fake
+  raw.githubusercontent, covering both bulk paths end to end.
+
+
 ## [1.4.4] - 2026-10-07
 
 ### Fixed

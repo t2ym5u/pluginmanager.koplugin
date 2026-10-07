@@ -748,11 +748,22 @@ end
 -- project-sudoku-common-architecture memory for why the two are NOT
 -- interchangeable. Each plugin_info names the one it needs via its own
 -- common_lib field, which indexes straight into manifest[lib_key] here.
-function PluginManager:ensureCommon(manifest, lib_key)
+--
+-- `force` skips the .version short-circuit and re-fetches the bundle even
+-- when the stamp already says it is current. Update wants the gate (there
+-- is nothing to re-download); Reinstall All must not have it. The stamp
+-- records a version, not integrity, so a bundle truncated by a mid-write
+-- crash or a half-finished run keeps a perfectly current .version and was
+-- silently skipped -- by the one action whose whole purpose is to re-fetch
+-- everything, and whose own prompt promises "including shared libraries".
+-- Worse, installPlugin then copies that stale bundle into every consuming
+-- plugin's common/, so the damage was propagated fleet-wide rather than
+-- repaired.
+function PluginManager:ensureCommon(manifest, lib_key, force)
     local spec = manifest[lib_key]
     local lib_dir = _plugins_dir .. "/" .. spec.dir
     local lfs     = get_lfs()
-    if lfs and lfs.attributes(lib_dir, "mode") == "directory" then
+    if not force and lfs and lfs.attributes(lib_dir, "mode") == "directory" then
         local vf = io.open(lib_dir .. "/.version", "r")
         if vf then
             local v = vf:read("*l"); vf:close()
@@ -2223,7 +2234,8 @@ end
 -- each plugin in `to_process` one at a time with progress feedback.
 -- `opts` lets callers customise the three user-facing strings without
 -- duplicating this whole flow: nothing_to_do_text, done_text (takes one
--- %d, the count), progress_text (same).
+-- %d, the count), progress_text (same). `opts.force_common` re-fetches the
+-- shared libraries even when their .version stamp is already current.
 function PluginManager:_runBulkInstall(manifest, to_process, opts)
     opts = opts or {}
     local installed = self:scanInstalled()
@@ -2242,7 +2254,9 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
         end
     end
     for lib_key in pairs(needed_libs) do
-        local ok, err = safe_call(function() return self:ensureCommon(manifest, lib_key) end)
+        local ok, err = safe_call(function()
+            return self:ensureCommon(manifest, lib_key, opts.force_common)
+        end)
         if not ok then
             logger.warn("PluginManager: " .. lib_key .. " error:", err)
             UIManager:show(InfoMessage:new{
@@ -2514,6 +2528,7 @@ function PluginManager:_doFullReinstall()
             nothing_to_do_text = _("No plugins installed."),
             done_text          = _("%d plugin(s) reinstalled."),
             progress_text      = _("Reinstalling %d plugin(s)\u{2026}"),
+            force_common       = true,
         })
     end)
 end
