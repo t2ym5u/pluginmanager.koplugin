@@ -3,6 +3,19 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.4.4] - 2026-10-07
+
+### Fixed
+- Bulk update/reinstall now asks for a restart whenever it installed anything,
+  not only when Plugin Manager had updated itself. KOReader loads plugin Lua
+  once at startup, so every file a bulk run writes stays inert until a
+  restart -- but the run ended on a bare "N plugin(s) updated" with no hint of
+  that. Updating the whole fleet and then opening a game showed the *previous*
+  version's behaviour, which reads exactly like an update that never shipped.
+  The single-plugin install path had always prompted; the bulk path now
+  matches it.
+
+
 ## [1.4.3] - 2026-10-02
 
 ### Fixed

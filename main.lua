@@ -2284,12 +2284,24 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
         for _i, fullname in ipairs(removed_renamed) do
             parts[#parts + 1] = string.format(_("Removed superseded %s."), fullname)
         end
+        -- KOReader only loads plugin Lua at startup (see is_plugin_disabled
+        -- above -- there is no live reload), so every file written by this
+        -- run is inert until a restart. This prompt used to be shown only
+        -- when Plugin Manager had updated *itself*, which meant a bulk run
+        -- that updated thirty games ended on a bare "30 plugin(s) updated"
+        -- and nothing said the new code wasn't live yet: the user opened a
+        -- game, got the previous version's behaviour, and reasonably
+        -- concluded the update had not been delivered. The single-plugin
+        -- install path has always prompted; the bulk path now matches it.
+        local succeeded = total - #failed
         if has_self then
             parts[#parts + 1] = _("Please restart KOReader to apply the Plugin Manager update.")
+        elseif succeeded > 0 then
+            parts[#parts + 1] = _("Please restart KOReader to apply the update.")
         end
         UIManager:show(InfoMessage:new{
             text    = table.concat(parts, "\n"),
-            timeout = has_self and 10 or 6,
+            timeout = (has_self or succeeded > 0) and 10 or 6,
         })
     end
 

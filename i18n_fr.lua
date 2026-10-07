@@ -33,6 +33,7 @@ return {
     ["Removed superseded %s."]   = { fr = "%s obsolète supprimé.", es = "%s obsoleto eliminado.", de = "Veraltetes %s entfernt." },
     ["%d/%d done. Failures:"]    = { fr = "%d/%d terminé(s). Échecs :", es = "%d/%d completado(s). Errores:", de = "%d/%d abgeschlossen. Fehler:" },
     ["%d plugin(s) updated/installed."] = { fr = "%d plugin(s) mis à jour/installé(s).", es = "%d plugin(s) actualizado(s)/instalado(s).", de = "%d Plugin(s) aktualisiert/installiert." },
+    ["Please restart KOReader to apply the update."] = { fr = "Redémarrez KOReader pour appliquer la mise à jour.", es = "Reinicie KOReader para aplicar la actualización.", de = "Starten Sie KOReader neu, um das Update anzuwenden." },
     ["Please restart KOReader to apply the Plugin Manager update."] = { fr = "Redémarrez KOReader pour appliquer la mise à jour du gestionnaire de plugins.", es = "Reinicie KOReader para aplicar la actualización del Gestor de plugins.", de = "Starten Sie KOReader neu, um das Update des Plugin-Managers anzuwenden." },
     ["%d/%d  %s\u{2026}"]        = { fr = "%d/%d  %s…", es = "%d/%d  %s…", de = "%d/%d  %s…" },
     ["Updating %d plugin(s)\u{2026}"] = { fr = "Mise à jour de %d plugin(s)…", es = "Actualizando %d plugin(s)…", de = "%d Plugin(s) werden aktualisiert…" },
