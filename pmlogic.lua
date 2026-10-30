@@ -350,4 +350,135 @@ function L.encodeJson(v, indent)
     return "{\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "}"
 end
 
+-- ---------------------------------------------------------------------------
+-- Discover: `user:NAME` (browse one GitHub account instead of searching)
+-- ---------------------------------------------------------------------------
+
+-- The account named by a Discover search text of the form `user:NAME`, or
+-- nil for an ordinary search. Shared by Discover plugins and Discover
+-- patches so both read the prefix the same way.
+function L.ownerQuery(filter)
+    if type(filter) ~= "string" then return nil end
+    local owner = filter:match("^%s*user:%s*(.-)%s*$")
+    if owner == nil or owner == "" then return nil end
+    return owner
+end
+
+-- GitHub sends `null` for an absent description, which rapidjson turns into
+-- a truthy sentinel: anything that is not a real string reads as "".
+local function str(v) return type(v) == "string" and v or "" end
+
+-- Whether a repository from an account listing (GET /users/NAME/repos) looks
+-- like a collection of KOReader user patches. Stricter than the search
+-- filter in main.lua (looks_like_koreader_patch_repo), which only has to
+-- clean up results a "koreader patches" search already matched: an account
+-- listing is everything the owner has, and "koreader" in a name alone would
+-- let in a KOReader fork or a plugin index. So it takes the patch topic, or
+-- "patch" in the name, or a description that names both KOReader and
+-- patches. A .koplugin repository is a plugin, never a patch collection.
+-- Whether the repository really holds patch files is only known when it is
+-- opened (one more API call each, too many for a whole account): opening
+-- one with none says so.
+function L.isOwnerPatchRepo(repo)
+    if type(repo) ~= "table" then return false end
+    local name = str(repo.name):lower()
+    local desc = str(repo.description):lower()
+    if name == "" or name:match("%.koplugin$") then return false end
+    if type(repo.topics) == "table" then
+        for _i, t in ipairs(repo.topics) do
+            if t == "koreader-user-patch" or t == "koreader-patch" or t == "koreader-patches" then
+                return true
+            end
+        end
+    end
+    if name:find("patch", 1, true) then return true end
+    return desc:find("patch", 1, true) ~= nil
+        and (desc:find("koreader", 1, true) ~= nil or name:find("koreader", 1, true) ~= nil)
+end
+
+-- ---------------------------------------------------------------------------
+-- Install everything (plugins + the manifest's patch repositories)
+-- ---------------------------------------------------------------------------
+
+-- The manifest's optional top-level `patch_repos` ("owner/name" strings),
+-- as {owner, name, full_name}. A manifest without the field, a field that
+-- is not a list, and entries that are not a plain owner/name are all read
+-- as "no patch repositories" rather than as an error: the field is
+-- optional, and the names end up in API URLs.
+function L.patchRepos(manifest)
+    local out, seen = {}, {}
+    local list = type(manifest) == "table" and manifest.patch_repos
+    if type(list) ~= "table" then return out end
+    for _i, s in ipairs(list) do
+        local owner, name
+        if type(s) == "string" then owner, name = s:match("^%s*(%w[%w%-]*)/([%w%-%_%.]+)%s*$") end
+        if name == "." or name == ".." then owner = nil end
+        if owner then
+            local full = owner .. "/" .. name
+            if not seen[full:lower()] then
+                seen[full:lower()] = true
+                out[#out + 1] = { owner = owner, name = name, full_name = full }
+            end
+        end
+    end
+    return out
+end
+
+-- Which listed patch files to install. `items` are listRepoPatchFiles
+-- results ({name, sha, ...}) from every repository, in manifest order;
+-- `installed` maps a patch filename to {disabled, sha}, sha being the git
+-- blob sha of the file on the device (or the one recorded at install, or
+-- nil when neither is known).
+--  - same sha as the repository: already current, left alone;
+--  - disabled on the device: left alone -- the user turned it off, and a
+--    bulk run must not quietly turn it back on (a single Install still can);
+--  - anything else (absent, different, unknown): installed.
+-- Two repositories shipping the same filename would write the same file:
+-- the first one listed wins, the others are reported as duplicates.
+function L.planPatchInstalls(items, installed)
+    installed = installed or {}
+    local plan = { install = {}, current = {}, disabled = {}, duplicate = {} }
+    local seen = {}
+    for _i, it in ipairs(items or {}) do
+        local name = type(it) == "table" and it.name
+        if type(name) == "string" then
+            local local_state = installed[name]
+            if seen[name] then
+                plan.duplicate[#plan.duplicate + 1] = it
+            elseif local_state and local_state.sha and it.sha and local_state.sha == it.sha then
+                plan.current[#plan.current + 1] = it
+            elseif local_state and local_state.disabled then
+                plan.disabled[#plan.disabled + 1] = it
+            else
+                plan.install[#plan.install + 1] = it
+            end
+            seen[name] = true
+        end
+    end
+    return plan
+end
+
+-- The numbers "Install everything" confirms with. `n_update`/`n_new` come
+-- from the Update plan; `repo_results` is one {full_name, items | err} per
+-- manifest patch repository (err when it could not be listed); `patch_plan`
+-- is planPatchInstalls over all listed items.
+function L.everythingCounts(n_update, n_new, repo_results, patch_plan)
+    local c = {
+        plugins_update   = n_update or 0,
+        plugins_new      = n_new or 0,
+        repos            = 0,
+        repos_failed     = 0,
+        patches          = patch_plan and #patch_plan.install or 0,
+        patches_current  = patch_plan and #patch_plan.current or 0,
+        patches_disabled = patch_plan and #patch_plan.disabled or 0,
+    }
+    c.plugins = c.plugins_update + c.plugins_new
+    for _i, r in ipairs(repo_results or {}) do
+        c.repos = c.repos + 1
+        if r.err or not r.items then c.repos_failed = c.repos_failed + 1 end
+    end
+    c.nothing_to_do = c.plugins == 0 and c.patches == 0
+    return c
+end
+
 return L

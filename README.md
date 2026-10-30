@@ -17,6 +17,7 @@ A plugin manager for [KOReader](https://github.com/koreader/koreader) that lets 
 - **Discover plugins** — search GitHub for third-party KOReader plugins (tagged `koreader-plugin`) and install them directly, outside the koreader-plugins repository
 - **Patches** — discover, install, update, disable/enable, and remove KOReader user patches (`koreader/patches/`) from GitHub, the same way appstore.koplugin does
 - **Restart now** — every change that needs a restart (install, update, enable/disable, patches, restore) offers KOReader's own *Restart now / Restart later* box; a bulk run asks once, at the end
+- **Install everything** — one tap installs or updates every plugin in the repository and every patch from the repository's own patch collections, then asks once to restart
 - **Update count** — the home screen's **Update** entry shows how many updates are waiting, e.g. *Update (3)*, from the cached plugin list (no network when opening the home screen)
 - **Screenshot** — preview a plugin's screenshot before installing it
 - **What's new** — before updating, read only the changelog entries between your version and the new one
@@ -44,6 +45,7 @@ Open **Tools → Plugin Manager**.
 | Action | How |
 |--------|-----|
 | Load/refresh the plugin catalogue and update everything outdated | Tap **Update** |
+| Install every plugin *and* the repository's patches in one go | Tap **Install everything…** (see below) |
 | Browse every plugin (installed and available) | Tap **Plugin list** |
 | Install a new plugin | In the plugin list, tap a plugin in the *Available* section → **Install** |
 | Update a single plugin | Tap a plugin showing `v1.0 → v1.1` → **Update to v1.1** |
@@ -166,6 +168,14 @@ of this plugin manages `.koplugin` plugins, and the same feature
   subfolder if it has one (both conventions exist in the wild) — with
   **Install**, **README…**, or **Install all N patches…** for the whole
   repository at once.
+- Type `user:NAME` in the search box to list one GitHub account's patch
+  repositories instead (e.g. `user:t2ym5u`), the same way Discover plugins
+  does for `.koplugin` repositories. A repository is listed when it carries
+  the `koreader-user-patch` topic, has "patch" in its name, or a description
+  mentioning both KOReader and patches. Listing an account costs one request
+  to GitHub's general API (60/hour unauthenticated) per 100 repositories,
+  not one per repository, so the patch files are only looked up when you
+  open one; a repository that turns out to hold none says so.
 - **Installed patches** lists everything currently in `patches/`, tagged
   `(GitHub)` if it was installed from here (enabling **Check for
   update**/**Reinstall**/README/**Unlink**) or `(local)` otherwise.
@@ -180,6 +190,37 @@ of this plugin manages `.koplugin` plugins, and the same feature
   individual patch's own enabled state.
 - As with Discover plugins, only install patches from sources you trust: a
   patch is arbitrary Lua code that runs with full access to KOReader.
+
+## Install everything
+
+**Install everything…** on the home screen does in one run what **Update**
+and **Patches → Install all N patches…** do separately:
+
+1. It fetches the plugin list and works out what **Update** would do — every
+   plugin not installed yet plus every update, skipping ignored versions and
+   anything needing a newer KOReader — then lists the patch files of each
+   repository named in the plugin list's `patch_repos` field.
+2. It confirms with the numbers: *Plugins: N to install, M to update* and
+   *Patches: P to install from K repositories*, plus anything skipped.
+3. It runs **Update**'s own bulk install, then installs the patches, and
+   ends on one summary and one *Restart now / Restart later* box.
+
+A patch already on the device with the same content as the repository's
+(compared by GitHub's blob SHA) is not downloaded again, and a patch you
+disabled stays disabled (it is named in the summary; install it from
+**Discover patches…** to turn it back on). A repository that cannot be
+listed — rate limit, network, renamed repository — is reported in the
+summary and never undoes or hides the plugin results. With a plugin list
+that has no `patch_repos` field, it is simply **Update** with a confirmation.
+**Update** itself is unchanged.
+
+`patch_repos` comes from `.github/scripts/patch_repos.json` in the
+koreader-plugins repository, which `update_manifest.py` copies into
+`manifest.json`:
+
+```json
+"patch_repos": ["t2ym5u/koreader-user-patches"]
+```
 
 ## Configuration (optional GitHub token)
 

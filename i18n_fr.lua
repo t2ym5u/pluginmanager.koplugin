@@ -273,4 +273,20 @@ return {
     ["GitHub plugins are third-party code \u{2014} only install plugins you trust."] = { fr = "Les plugins GitHub sont du code tiers — n'installez que des plugins de confiance.", es = "Los plugins de GitHub son código de terceros: instale solo plugins de confianza.", de = "GitHub-Plugins sind Code von Dritten – installieren Sie nur Plugins, denen Sie vertrauen." },
     ["No plugin to install from the repository."] = { fr = "Aucun plugin à installer depuis le dépôt.", es = "Ningún plugin que instalar desde el repositorio.", de = "Kein Plugin aus dem Repository zu installieren." },
     ["Installing %d plugin(s)\u{2026}"] = { fr = "Installation de %d plugin(s)…", es = "Instalando %d plugin(s)…", de = "%d Plugin(s) werden installiert…" },
+
+    -- Discover patches: user:NAME
+    ["Type user:NAME to browse every patch repository from one GitHub account."]
+        = { fr = "Tapez user:NOM pour parcourir tous les dépôts de patchs d'un compte GitHub.", es = "Escriba user:NOMBRE para explorar todos los repositorios de parches de una cuenta de GitHub.", de = "Geben Sie user:NAME ein, um alle Patch-Repositorys eines GitHub-Kontos zu durchsuchen." },
+    ["No patch repositories found for \u{201c}%s\u{201d}."] = { fr = "Aucun dépôt de patchs trouvé pour « %s ».", es = "No se encontraron repositorios de parches para «%s».", de = "Keine Patch-Repositorys für „%s“ gefunden." },
+
+    -- Install everything
+    ["Install everything\u{2026}"] = { fr = "Tout installer…", es = "Instalar todo…", de = "Alles installieren…" },
+    ["Install everything?"]       = { fr = "Tout installer ?", es = "¿Instalar todo?", de = "Alles installieren?" },
+    ["Plugins: %d to install, %d to update."] = { fr = "Plugins : %d à installer, %d à mettre à jour.", es = "Plugins: %d por instalar, %d por actualizar.", de = "Plugins: %d zu installieren, %d zu aktualisieren." },
+    ["Patches: %d to install from %d repositories."] = { fr = "Patchs : %d à installer depuis %d dépôt(s).", es = "Parches: %d por instalar desde %d repositorio(s).", de = "Patches: %d zu installieren aus %d Repository(s)." },
+    ["Left disabled: %s"]         = { fr = "Laissés désactivés : %s", es = "Se dejan desactivados: %s", de = "Deaktiviert gelassen: %s" },
+    ["Could not list patches from %s: %s"] = { fr = "Impossible de lister les patchs de %s : %s", es = "No se pudieron listar los parches de %s: %s", de = "Patches von %s konnten nicht aufgelistet werden: %s" },
+    ["All patches are up to date."] = { fr = "Tous les patchs sont à jour.", es = "Todos los parches están actualizados.", de = "Alle Patches sind aktuell." },
+    ["Patches: %d/%d installed. Failures:"] = { fr = "Patchs : %d/%d installés. Échecs :", es = "Parches: %d/%d instalados. Errores:", de = "Patches: %d/%d installiert. Fehler:" },
+    ["%d patch(es) installed."]   = { fr = "%d patch(s) installé(s).", es = "%d parche(s) instalado(s).", de = "%d Patch(es) installiert." },
 }

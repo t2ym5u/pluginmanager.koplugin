@@ -3,6 +3,36 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.6.0] - 2026-10-30
+
+### Added
+- Install everything: a home-screen entry that runs Update (every catalogue
+  plugin not installed plus every update, ignored versions and
+  `min_koreader` respected) and then installs every patch file of the
+  repositories in the manifest's new optional top-level `patch_repos`
+  field, after one confirmation with the counts, ending on one summary and
+  one restart prompt. A patch already at the repository's content (git blob
+  SHA) is not downloaded again, a disabled one is left disabled, and a
+  repository that cannot be listed is reported without hiding the plugin
+  results. A manifest without `patch_repos` makes it Update with a
+  confirmation.
+- Discover patches: `user:NAME` lists one GitHub account's patch
+  repositories (topic `koreader-user-patch`, "patch" in the name, or a
+  description naming KOReader and patches), one general-API request per
+  100 repositories, then the usual per-repository patch list. The search
+  dialog says so.
+- `pmlogic.lua`: `ownerQuery`, `isOwnerPatchRepo`, `patchRepos`,
+  `planPatchInstalls`, `everythingCounts`, specced in
+  `test_pmlogic_spec.lua`; the whole flow is driven end to end by
+  `test_install_everything_spec.lua`.
+
+### Changed
+- A shared-library error during a bulk run no longer stops Import's GitHub
+  installs (or Install everything's patches): the error heads the final
+  summary instead.
+- "Install all N patches" shows per-patch progress (it shares Install
+  everything's patch loop).
+
 ## [1.5.0] - 2026-10-30
 
 ### Added
