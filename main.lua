@@ -27,6 +27,9 @@ local _               = lrequire("i18n")
 -- plugins, nor merge its own strings into their shared table.
 lrequire("i18n").extend(lrequire("i18n_fr"))
 
+-- Pure decision logic (no KOReader dependency), specced in test_pmlogic_spec.lua.
+local PMLogic = lrequire("pmlogic")
+
 local MANIFEST_URL   = "https://raw.githubusercontent.com/t2ym5u/koreader-plugins/master/manifest.json"
 local AUTO_CHECK_TTL = 86400  -- re-check automatically at most once every 24 h
 local _patches_dir   = DataStorage:getPatchesDir()  -- koreader/patches, see frontend/userpatch.lua
@@ -115,6 +118,72 @@ function PluginManager:setIgnoredVersion(id, version)
     ignored[id] = version
     self.settings:saveSetting("ignored_versions", ignored)
     self.settings:flush()
+end
+
+-- ---------------------------------------------------------------------------
+-- Restart prompt
+-- ---------------------------------------------------------------------------
+
+-- KOReader loads plugin and patch Lua once, at startup, so every change this
+-- plugin makes waits for a restart. Rather than only saying so, offer it:
+-- UIManager:askForRestart shows KOReader's own "Restart now / Restart later"
+-- box where the device can restart itself, and a plain notice where it
+-- cannot. It needs the Restart handler the device layer installs; without
+-- it (an older KOReader, or a test harness) the text is shown as a plain
+-- notice. Both land on the next tick, so the box comes out on top of a
+-- screen rebuilt in the same callback (showScreenMenu's `reopen`).
+function PluginManager:askRestart(text)
+    if UIManager.askForRestart and UIManager.event_handlers
+       and UIManager.event_handlers.Restart and UIManager.event_handlers.PowerOff then
+        UIManager:askForRestart(text)
+        return
+    end
+    UIManager:nextTick(function()
+        UIManager:show(InfoMessage:new{ text = text, timeout = 8 })
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- KOReader version (manifest `min_koreader`)
+-- ---------------------------------------------------------------------------
+
+-- Normalised the way frontend/version.lua does it; nil when KOReader cannot
+-- say (no version module, or a dev build), which PMLogic treats as
+-- "compatible" -- the field warns, it never locks anyone out.
+local function koreader_version()
+    local ok, Version = pcall(require, "version")
+    if not ok or type(Version) ~= "table" or not Version.getNormalizedCurrentVersion then return nil end
+    local ok2, v = pcall(Version.getNormalizedCurrentVersion, Version)
+    return ok2 and v or nil
+end
+
+local function koreader_short_version()
+    local ok, Version = pcall(require, "version")
+    if ok and type(Version) == "table" and Version.getShortVersion then
+        local ok2, v = pcall(Version.getShortVersion, Version)
+        if ok2 and v then return v end
+    end
+    return "?"
+end
+
+function PluginManager:isCompatible(plugin_info)
+    local min = plugin_info and plugin_info.min_koreader
+    return PMLogic.koreaderCompatible(type(min) == "string" and min or nil, koreader_version())
+end
+
+-- Runs `proceed` straight away for a compatible plugin; otherwise says what
+-- it needs and lets the user install anyway (a plugin may well degrade
+-- gracefully -- only its author's declared minimum is known here).
+function PluginManager:confirmCompatible(plugin_info, proceed)
+    if self:isCompatible(plugin_info) then return proceed() end
+    UIManager:show(ConfirmBox:new{
+        text        = string.format(
+            _("%s v%s needs KOReader %s or newer (this is %s).\nIt may not work. Install anyway?"),
+            plugin_info.fullname, plugin_info.version, plugin_info.min_koreader, koreader_short_version()
+        ),
+        ok_text     = _("Install anyway"),
+        ok_callback = proceed,
+    })
 end
 
 -- ---------------------------------------------------------------------------
@@ -281,6 +350,12 @@ end
 -- unauthenticated rate limit (10 requests/minute). Mirrors the same pattern
 -- appstore.koplugin uses, so anyone already familiar with that plugin's
 -- config file recognises this one.
+-- Files a user puts in a plugin's folder by hand. Installs never delete them
+-- as stale (see installPlugin).
+local USER_FILES = {
+    ["pluginmanager_configuration.lua"] = true,
+}
+
 local function github_config()
     local ok, cfg = pcall(require, "pluginmanager_configuration")
     return ok and cfg or {}
@@ -505,20 +580,10 @@ parse_json = _parse_json
 -- Version comparison
 -- ---------------------------------------------------------------------------
 
-local function is_newer(a, b)
-    local function parts(v)
-        local t = {}
-        for n in (v or "0"):gmatch("%d+") do t[#t + 1] = tonumber(n) end
-        return t
-    end
-    local ap, bp = parts(a), parts(b)
-    for i = 1, math.max(#ap, #bp) do
-        local ai, bi = ap[i] or 0, bp[i] or 0
-        if bi > ai then return true end
-        if bi < ai then return false end
-    end
-    return false
-end
+-- True when `b` is newer than `a`. Lives in pmlogic.lua so the update count,
+-- the changelog slicing and the integrity drift rule all compare versions
+-- the same way.
+local is_newer = PMLogic.isNewer
 
 -- ---------------------------------------------------------------------------
 -- Filesystem helpers
@@ -670,6 +735,21 @@ end
 -- Silent background check  (auto, called from init)
 -- ---------------------------------------------------------------------------
 
+-- The one definition of "an update is available", shared by the home
+-- screen's count, the silent check and the Update button so the three never
+-- disagree: an installed plugin whose manifest version is newer, not
+-- ignored, and runnable on this KOReader. The second list holds the updates
+-- held back by min_koreader. No network: `manifest` is whatever is cached.
+function PluginManager:pendingUpdates(manifest, installed)
+    if not manifest or type(manifest.plugins) ~= "table" then return {}, {} end
+    return PMLogic.pendingUpdates(
+        manifest.plugins,
+        installed or self:scanInstalled(),
+        function(id, version) return self:isVersionIgnored(id, version) end,
+        function(p) return self:isCompatible(p) end
+    )
+end
+
 function PluginManager:_silentCheck()
     -- Only run if already connected; never prompt the user.
     local ok, NetworkMgr = pcall(require, "ui/network/manager")
@@ -682,14 +762,8 @@ function PluginManager:_silentCheck()
     self._manifest = manifest
     self:saveManifestCache(manifest)
 
-    local installed = self:scanInstalled()
-    local n_update  = 0
-    for _, p in ipairs(manifest.plugins) do
-        local inst = installed[p.id]
-        if inst and is_newer(inst.version, p.version) and not self:isVersionIgnored(p.id, p.version) then
-            n_update = n_update + 1
-        end
-    end
+    local n_update = #self:pendingUpdates(manifest)
+    self:refreshHome()
     if n_update > 0 then
         UIManager:show(InfoMessage:new{
             text    = string.format(_("Plugin Manager: %d update(s) available."), n_update),
@@ -742,6 +816,90 @@ end
 -- Install helpers
 -- ---------------------------------------------------------------------------
 
+-- Two working folders, both inside plugins/: a plugin's next version is
+-- assembled in .pluginmanager-staging/<dir> before anything live is touched,
+-- and the version an update replaces is kept in .pluginmanager-backup/<dir>
+-- for "Restore previous version". Inside plugins/ because that is the same
+-- filesystem as the plugins themselves (os.rename moves instead of copying)
+-- and because rm_rf's guard already covers it; dot-prefixed and without the
+-- .koplugin suffix, so neither KOReader's PluginLoader nor scanInstalled()
+-- ever takes them for a plugin. PathGuard.pluginPath validates `dir` -- it
+-- comes from manifest.json -- before it becomes a path under either.
+local STAGING_DIR = ".pluginmanager-staging"
+local BACKUP_DIR  = ".pluginmanager-backup"
+
+local function staging_path(dir) return PathGuard.pluginPath(_plugins_dir .. "/" .. STAGING_DIR, dir) end
+local function backup_path(dir)  return PathGuard.pluginPath(_plugins_dir .. "/" .. BACKUP_DIR, dir) end
+
+local function copy_file(src, dst)
+    local f = io.open(src, "rb")
+    if not f then return false end
+    local data = f:read("*a")
+    f:close()
+    return write_file(dst, data)
+end
+
+local function copy_tree(src, dst)
+    local lfs = get_lfs()
+    if not lfs then return false end
+    mkdir_p(dst)
+    for entry in lfs.dir(src) do
+        if entry ~= "." and entry ~= ".." then
+            local s, d = src .. "/" .. entry, dst .. "/" .. entry
+            local mode = lfs.attributes(s, "mode")
+            if mode == "directory" then
+                if not copy_tree(s, d) then return false end
+            elseif mode == "file" then
+                if not copy_file(s, d) then return false end
+            end
+        end
+    end
+    return true
+end
+
+-- SHA-256 from KOReader's own base library (ffi/sha2, on every device).
+-- nil when it cannot be loaded, which switches hash checking off -- never
+-- installing.
+local _sha256
+local function sha256(body)
+    if _sha256 == nil then
+        local ok, sha2 = pcall(require, "ffi/sha2")
+        _sha256 = ok and type(sha2) == "table" and sha2.sha256 or false
+    end
+    if not _sha256 then return nil end
+    local ok, h = pcall(_sha256, body)
+    return ok and h or nil
+end
+
+-- The manifest's expected hash for `fname`, or nil: a manifest written
+-- before the sha256 maps existed simply has none, and installs unverified
+-- exactly as it always did.
+local function expected_hash(map, fname)
+    local h = type(map) == "table" and map[fname]
+    return type(h) == "string" and h ~= "" and h or nil
+end
+
+-- Downloads one file and checks it. Returns (body, verdict, compiles) --
+-- verdict is PMLogic.hashVerdict's "ok" / "unverified" / "mismatch",
+-- compiles is false only for a .lua file that does not compile -- or
+-- (nil, err) when the download itself failed.
+--
+-- A file failing either check is fetched once more before anything is
+-- concluded: a transfer cut short, or a CDN edge still serving half of a
+-- fresh push, usually comes back right the second time.
+local function fetch_checked(url, fname, expected)
+    local body, verdict, compiles
+    for _attempt = 1, 2 do
+        local b, err = fetch_url(url)
+        if not b then return nil, err end
+        body     = b
+        verdict  = PMLogic.hashVerdict(expected, expected and sha256(b))
+        compiles = not PMLogic.isLuaFile(fname) or PMLogic.compiles(b, fname)
+        if verdict ~= "mismatch" and compiles then break end
+    end
+    return body, verdict, compiles
+end
+
 -- `lib_key` is a manifest.json top-level key naming a downloadable common/
 -- bundle -- "common" (game-common, ScreenBase-based games) or
 -- "sudoku_common" (sudoku-common, BaseScreen-based sudoku variants); see the
@@ -759,9 +917,19 @@ end
 -- Worse, installPlugin then copies that stale bundle into every consuming
 -- plugin's common/, so the damage was propagated fleet-wide rather than
 -- repaired.
+--
+-- Every file is downloaded and checked before the first one is written, so
+-- a failure leaves the bundle on disk as it was. A shared library has no
+-- _meta.lua to tell "upstream moved ahead of the manifest" from "stale
+-- copy", so a hash mismatch that survives the re-download is accepted for a
+-- .lua that compiles (the common case: the library was pushed and the
+-- manifest not yet regenerated) and refused for anything else.
 function PluginManager:ensureCommon(manifest, lib_key, force)
-    local spec = manifest[lib_key]
-    local lib_dir = _plugins_dir .. "/" .. spec.dir
+    local spec    = manifest[lib_key]
+    local lib_dir = PathGuard.pluginPath(_plugins_dir, spec.dir)
+    if not lib_dir then
+        return false, string.format("%s: refused directory entry %q", lib_key, tostring(spec.dir))
+    end
     local lfs     = get_lfs()
     if not force and lfs and lfs.attributes(lib_dir, "mode") == "directory" then
         local vf = io.open(lib_dir .. "/.version", "r")
@@ -770,56 +938,208 @@ function PluginManager:ensureCommon(manifest, lib_key, force)
             if not is_newer(v or "0", spec.version) then return true end
         end
     end
-    mkdir_p(lib_dir)
-    local base = spec.raw_base_url or ((manifest.raw_base_url or "") .. spec.dir .. "/")
-    for _, fname in ipairs(spec.files) do
-        local body, err = fetch_url(base .. fname)
-        if not body then
-            return false, string.format("%s/%s: %s", spec.dir, fname, err)
-        end
+    local base    = spec.raw_base_url or ((manifest.raw_base_url or "") .. spec.dir .. "/")
+    local fetched = {}
+    for _i, fname in ipairs(spec.files) do
         -- fname comes straight out of manifest.json, so it is checked
         -- before it becomes a path, the same way `dir` already is.
         local dest = PathGuard.filePath(lib_dir, fname)
         if not dest then
             return false, string.format("%s: refused file entry %q", spec.dir, tostring(fname))
         end
-        local subdir = dest:match("^(.*)/[^/]+$")
-        if subdir then mkdir_p(subdir) end
-        write_file(dest, body)
+        local body, verdict, compiles = fetch_checked(base .. fname, fname, expected_hash(spec.sha256, fname))
+        if not body then
+            return false, string.format("%s/%s: %s", spec.dir, fname, verdict)
+        end
+        if not compiles then
+            return false, string.format(_("%s does not compile (incomplete download?)"), spec.dir .. "/" .. fname)
+        end
+        if verdict == "mismatch" then
+            if not PMLogic.isLuaFile(fname) then
+                return false, string.format(_("%s failed its integrity check."), spec.dir .. "/" .. fname)
+            end
+            logger.info("PluginManager: accepted hash drift for", spec.dir .. "/" .. fname)
+        end
+        fetched[#fetched + 1] = { dest = dest, body = body }
     end
+    mkdir_p(lib_dir)
+    for _i, f in ipairs(fetched) do
+        local subdir = f.dest:match("^(.*)/[^/]+$")
+        if subdir then mkdir_p(subdir) end
+        local ok, werr = write_file(f.dest, f.body)
+        if not ok then
+            return false, string.format("%s: %s", f.dest, tostring(werr))
+        end
+    end
+    -- Stamped last: a run that dies before this point leaves the old stamp,
+    -- so the next Update fetches the bundle again.
     write_file(lib_dir .. "/.version", spec.version)
     return true
 end
 
+-- ---------------------------------------------------------------------------
+-- Roll back: the version an update replaced
+-- ---------------------------------------------------------------------------
+
+-- Version of the kept copy of `dir`, or nil when there is none.
+function PluginManager:getBackupVersion(dir)
+    local path = backup_path(dir)
+    if not path then return nil end
+    local meta = read_meta(path .. "/_meta.lua")
+    return meta and meta.version or nil
+end
+
+-- Keeps the version about to be replaced. Only a real version change is
+-- kept: reinstalling the same version would otherwise overwrite the one
+-- useful copy (the version before the last update) with what is installed
+-- now. One version per plugin -- the previous one -- and best effort: a
+-- backup that cannot be written never blocks the update itself.
+function PluginManager:backupPlugin(plugin_info, plugin_dir)
+    local lfs = get_lfs()
+    if not lfs or lfs.attributes(plugin_dir, "mode") ~= "directory" then return end
+    local meta = read_meta(plugin_dir .. "/_meta.lua")
+    if not meta or not meta.version or meta.version == plugin_info.version then return end
+    local dest = backup_path(plugin_info.dir)
+    if not dest then return end
+    rm_rf(dest)
+    mkdir_p(_plugins_dir .. "/" .. BACKUP_DIR)
+    local ok = safe_call(copy_tree, plugin_dir, dest)
+    if not ok then rm_rf(dest) end
+end
+
+-- Puts the kept copy back in place of the installed plugin. A swap of two
+-- renames on one filesystem: installed -> staging, backup -> installed, so
+-- there is never a moment with no plugin directory at all, and if the
+-- second rename fails the first is undone. Every path goes through
+-- PathGuard and every delete through rm_rf. Returns (true, version) or
+-- (false, message).
+function PluginManager:restoreBackup(dir)
+    local live   = PathGuard.pluginPath(_plugins_dir, dir)
+    local backup = backup_path(dir)
+    local aside  = staging_path(dir)
+    if not live or not backup or not aside then
+        return false, _("Refused: unsafe directory name.")
+    end
+    local meta = read_meta(backup .. "/_meta.lua")
+    if not meta or not meta.version then
+        return false, _("No previous version is kept for this plugin.")
+    end
+    local lfs = get_lfs()
+    if not lfs then return false, _("No previous version is kept for this plugin.") end
+    rm_rf(aside)
+    mkdir_p(_plugins_dir .. "/" .. STAGING_DIR)
+    local had_live = lfs.attributes(live, "mode") == "directory"
+    if had_live and not os.rename(live, aside) then
+        return false, _("Could not restore the previous version.")
+    end
+    if not os.rename(backup, live) then
+        if had_live then os.rename(aside, live) end
+        return false, _("Could not restore the previous version.")
+    end
+    rm_rf(aside)
+    return true, meta.version
+end
+
+-- Installs or updates one plugin, in three steps:
+--
+-- 1. Every file is downloaded into the staging folder and checked. Nothing
+--    under the plugin's own directory is touched yet, so any failure leaves
+--    the installed version exactly as it was. (The old code wrote each file
+--    over the live plugin as it arrived; a download failing half way left a
+--    mix of two versions that KOReader then failed to load.)
+-- 2. Checks. Every .lua must compile, whatever the manifest says: that alone
+--    catches a truncated download. When the manifest carries sha256, each
+--    file must also match it -- except that a mismatch can be legitimate:
+--    files come from raw.githubusercontent at the branch head, hashes from
+--    the monorepo's checked-out submodule at the last manifest regeneration,
+--    and between a plugin push and the next regeneration the two differ. So
+--    a mismatch that survives a re-download is accepted when the downloaded
+--    _meta.lua is at least the manifest's version (upstream moved ahead),
+--    and refused when it is older (a stale copy; see PMLogic.driftAcceptable).
+--    Drift therefore never blocks a good install, and a refused install
+--    leaves nothing behind.
+-- 3. The version being replaced is kept for roll back, then the staged
+--    files are moved into place.
 function PluginManager:installPlugin(plugin_info, manifest)
-    local plugin_dir = _plugins_dir .. "/" .. plugin_info.dir
-    mkdir_p(plugin_dir)
-    local base = plugin_info.raw_base_url or ((manifest.raw_base_url or "") .. plugin_info.dir .. "/")
-    for idx, fname in ipairs(plugin_info.files) do
-        local body, err = fetch_url(base .. fname)
+    local plugin_dir = PathGuard.pluginPath(_plugins_dir, plugin_info.dir)
+    local stage      = staging_path(plugin_info.dir)
+    if not plugin_dir or not stage then
+        return false, string.format(_("Refused file entry: %s"), tostring(plugin_info.dir))
+    end
+    local base   = plugin_info.raw_base_url or ((manifest.raw_base_url or "") .. plugin_info.dir .. "/")
+    local hashes = plugin_info.sha256
+
+    local function fail(msg)
+        rm_rf(stage)
+        return false, msg
+    end
+
+    -- 1. Download into staging.
+    rm_rf(stage)
+    mkdir_p(stage)
+    local drifted, meta_body = {}, nil
+    for _i, fname in ipairs(plugin_info.files) do
+        -- Checked against both trees: the entry names where it will finally
+        -- land, not just where it is staged.
+        local staged = PathGuard.filePath(stage, fname)
+        if not staged or not PathGuard.filePath(plugin_dir, fname) then
+            return fail(string.format(_("Refused file entry: %s"), tostring(fname)))
+        end
+        local body, verdict, compiles = fetch_checked(base .. fname, fname, expected_hash(hashes, fname))
         if not body then
-            return false, string.format(_("Download failed: %s \u{2014} %s"), fname, err)
+            return fail(string.format(_("Download failed: %s \u{2014} %s"), fname, verdict))
         end
-        local dest = PathGuard.filePath(plugin_dir, fname)
-        if not dest then
-            return false, string.format(_("Refused file entry: %s"), tostring(fname))
+        -- 2a. Compile check.
+        if not compiles then
+            return fail(string.format(_("%s does not compile (incomplete download?)"), fname))
         end
-        local subdir = dest:match("^(.*)/[^/]+$")
+        if verdict == "mismatch" then drifted[#drifted + 1] = fname end
+        if fname == "_meta.lua" then meta_body = body end
+        local subdir = staged:match("^(.*)/[^/]+$")
         if subdir then mkdir_p(subdir) end
-        local ok, werr = write_file(dest, body)
+        local ok, werr = write_file(staged, body)
         if not ok then
-            return false, string.format(_("Write failed: %s \u{2014} %s"), fname, werr)
+            return fail(string.format(_("Write failed: %s \u{2014} %s"), fname, werr))
         end
     end
+
+    -- 2b. Hash drift.
+    if #drifted > 0 then
+        local meta_version = meta_body and parse_meta(meta_body).version
+        if not PMLogic.driftAcceptable(meta_version, plugin_info.version) then
+            return fail(string.format(
+                _("%s failed its integrity check (%s)."),
+                plugin_info.fullname or plugin_info.id, table.concat(drifted, ", ")
+            ))
+        end
+        logger.info("PluginManager:", plugin_info.id, "accepted hash drift, upstream is ahead of the manifest:",
+            table.concat(drifted, ", "))
+    end
+
+    -- 3. Keep the replaced version, then commit.
+    self:backupPlugin(plugin_info, plugin_dir)
+    mkdir_p(plugin_dir)
+    for _i, fname in ipairs(plugin_info.files) do
+        local src  = PathGuard.filePath(stage, fname)
+        local dest = PathGuard.filePath(plugin_dir, fname)
+        local subdir = dest:match("^(.*)/[^/]+$")
+        if subdir then mkdir_p(subdir) end
+        if not os.rename(src, dest) and not copy_file(src, dest) then
+            return fail(string.format(_("Write failed: %s \u{2014} %s"), fname, "rename"))
+        end
+    end
+    rm_rf(stage)
 
     -- Remove stale files left over from a previous version (renamed/removed
     -- source files) that are no longer listed for this version. Only
     -- top-level regular files are considered; `common` and any other
-    -- subdirectory are never touched here.
+    -- subdirectory are never touched here. Files the user creates beside the
+    -- plugin's own (USER_FILES) are never in the manifest and must survive:
+    -- a Plugin Manager self-update used to delete the GitHub token.
     local expected = {}
-    for _, fname in ipairs(plugin_info.files) do expected[fname] = true end
-    for _, fname in ipairs(list_top_level_files(plugin_dir)) do
-        if not expected[fname] then
+    for _i, fname in ipairs(plugin_info.files) do expected[fname] = true end
+    for _i, fname in ipairs(list_top_level_files(plugin_dir)) do
+        if not expected[fname] and not USER_FILES[fname] then
             os.remove(plugin_dir .. "/" .. fname)
         end
     end
@@ -836,10 +1156,10 @@ function PluginManager:installPlugin(plugin_info, manifest)
         -- handful of .lua files) and guarantees common/ is never stale.
         local spec = manifest[plugin_info.common_lib]
         local common_path = plugin_dir .. "/common"
-        local lib_dir = _plugins_dir .. "/" .. spec.dir
+        local lib_dir = PathGuard.pluginPath(_plugins_dir, spec.dir)
         local lfs = get_lfs()
         mkdir_p(common_path)
-        if lfs and lfs.attributes(lib_dir, "mode") == "directory" then
+        if lib_dir and lfs and lfs.attributes(lib_dir, "mode") == "directory" then
             for fname in lfs.dir(lib_dir) do
                 if fname:match("%.lua$") then
                     local src = io.open(lib_dir .. "/" .. fname, "rb")
@@ -875,19 +1195,17 @@ function PluginManager:_doInstall(plugin_info, manifest)
         end
         local ok, err = safe_call(function() return self:installPlugin(plugin_info, manifest) end)
         if ok then
+            self:refreshHome()
             local is_self = plugin_info.id == "pluginmanager"
-            UIManager:show(InfoMessage:new{
-                text    = is_self
-                    and string.format(
-                        _("%s v%s installed.\nPlease restart KOReader to apply the update."),
-                        plugin_info.fullname, plugin_info.version
-                    )
-                    or  string.format(
-                        _("%s v%s installed."),
-                        plugin_info.fullname, plugin_info.version
-                    ),
-                timeout = is_self and 8 or 6,
-            })
+            self:askRestart(is_self
+                and string.format(
+                    _("%s v%s installed.\nPlease restart KOReader to apply the update."),
+                    plugin_info.fullname, plugin_info.version
+                )
+                or  string.format(
+                    _("%s v%s installed.\nPlease restart KOReader to load it."),
+                    plugin_info.fullname, plugin_info.version
+                ))
         else
             logger.warn("PluginManager: install failed for", plugin_info.id, ":", err)
             UIManager:show(InfoMessage:new{
@@ -1070,14 +1388,16 @@ function PluginManager:installFromGithubRepo(repo, on_done)
             local meta = read_meta(dest_dir .. "/_meta.lua")
             local id   = layout.dirname:match("^(.*)%.koplugin$") or layout.dirname
             self:recordDiscoverInstall(id, repo)
-            UIManager:show(InfoMessage:new{
-                text    = string.format(
+            if on_done then
+                -- Part of a batch: the batch asks for the restart once, at
+                -- the end, instead of one prompt per plugin.
+                on_done(true)
+            else
+                self:askRestart(string.format(
                     _("%s installed.\nPlease restart KOReader to load it."),
                     (meta and meta.fullname) or repo.name
-                ),
-                timeout = 8,
-            })
-            if on_done then on_done(true) end
+                ))
+            end
         end
 
         local conflict = self:describeExistingInstall(layout.dirname, repo)
@@ -1104,8 +1424,11 @@ end
 
 -- Installs every repo in `repos` one at a time (never in parallel -- keeps
 -- memory pressure and GitHub API usage predictable, same reasoning as the
--- manifest-driven bulk install in _runBulkInstall), then shows one summary.
-function PluginManager:installAllFromGithub(repos)
+-- manifest-driven bulk install in _runBulkInstall), then shows one summary
+-- and asks for the restart once. `on_done(parts, succeeded)`, if given,
+-- receives the summary lines instead (Import chains this after its own
+-- batch and asks once for both).
+function PluginManager:installAllFromGithub(repos, on_done)
     local total  = #repos
     local failed = {}
     local function step(i)
@@ -1115,20 +1438,29 @@ function PluginManager:installAllFromGithub(repos)
                 parts[#parts + 1] = string.format(_("%d/%d installed. Failures:"), total - #failed, total)
                 for _, f in ipairs(failed) do parts[#parts + 1] = f end
             else
-                parts[#parts + 1] = string.format(
-                    _("%d plugin(s) installed.\nPlease restart KOReader to load them."), total
-                )
+                parts[#parts + 1] = string.format(_("%d plugin(s) installed."), total)
             end
-            UIManager:show(InfoMessage:new{ text = table.concat(parts, "\n"), timeout = 10 })
+            local succeeded = total - #failed
+            if on_done then return on_done(parts, succeeded) end
+            self:_showSummary(parts, succeeded > 0)
             return
         end
         local repo = repos[i]
-        self:installFromGithubRepo(repo, function(ok, err)
-            if not ok then
-                failed[#failed + 1] = repo.full_name .. ": " .. (err or "?")
-            end
-            step(i + 1)
+        -- safe_call: one malformed repo must not stop the batch (see the
+        -- note on safe_call at the top of this file).
+        local ok_call, call_err = safe_call(function()
+            self:installFromGithubRepo(repo, function(ok, err)
+                if not ok then
+                    failed[#failed + 1] = repo.full_name .. ": " .. (err or "?")
+                end
+                step(i + 1)
+            end)
+            return true
         end)
+        if not ok_call then
+            failed[#failed + 1] = tostring(repo.full_name) .. ": " .. (call_err or "?")
+            UIManager:scheduleIn(0, function() step(i + 1) end)
+        end
     end
     step(1)
 end
@@ -1478,8 +1810,13 @@ function PluginManager:_doRemove(fullname, plugin_dir)
         return
     end
     rm_rf(target)
+    -- Its kept previous version goes with it: nothing could restore it
+    -- (the restore button lives on the installed plugin's dialog).
+    local backup = backup_path(plugin_dir)
+    if backup then rm_rf(backup) end
     local id = plugin_dir:match("^(.*)%.koplugin$")
     if id then self:forgetDiscoverInstall(id) end
+    self:refreshHome()
     UIManager:show(InfoMessage:new{
         text    = string.format(_("%s removed."), fullname),
         timeout = 5,
@@ -1602,6 +1939,163 @@ function PluginManager:showReadme(url, title, cache_key)
 end
 
 -- ---------------------------------------------------------------------------
+-- What's new (CHANGELOG.md between the installed and the offered version)
+-- ---------------------------------------------------------------------------
+
+local function cache_path(name)
+    return DataStorage:getDataDir() .. "/cache/pluginmanager/" .. name:gsub("[^%w%-%.]", "_")
+end
+
+local function read_file(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local body = f:read("*a")
+    f:close()
+    return body ~= "" and body or nil
+end
+
+-- Runs fn now when online, or after KOReader has brought the network up
+-- (asking the user first, as every other network action here does).
+local function when_online(fn)
+    local ok, NetworkMgr = pcall(require, "ui/network/manager")
+    if ok and NetworkMgr then NetworkMgr:runWhenOnline(fn) else fn() end
+end
+
+-- The changelog is cached per *offered* version, like a README but without
+-- a Refresh button: the sections up to that version do not change once it
+-- is released, and a newer manifest version is a new cache key anyway.
+function PluginManager:showWhatsNew(plugin_info, inst_info)
+    if not plugin_info.raw_base_url then
+        UIManager:show(InfoMessage:new{ text = _("No changelog available for this plugin."), timeout = 4 })
+        return
+    end
+    local path = cache_path("changelog_" .. plugin_info.id .. "_" .. plugin_info.version .. ".md")
+
+    local function display(body)
+        -- Only what changed since the installed version; the whole file
+        -- when its headings cannot be read, or when none falls in range
+        -- (a version bumped without a changelog line) -- something is
+        -- always better than an empty viewer.
+        local slice = PMLogic.changelogSlice(body, inst_info.version, plugin_info.version)
+        local text  = (slice and slice ~= "") and slice or body
+        local TextViewer = require("ui/widget/textviewer")
+        local viewer
+        viewer = TextViewer:new{
+            title               = string.format(_("What's new: %s v%s \u{2192} v%s"),
+                inst_info.fullname, inst_info.version, plugin_info.version),
+            text                = text,
+            text_format         = textviewer_supports_md() and "md" or nil,
+            add_default_buttons = true,
+            buttons_table       = {{
+                {
+                    text     = string.format(_("Update to v%s"), plugin_info.version),
+                    callback = function()
+                        UIManager:close(viewer)
+                        self:confirmCompatible(plugin_info, function()
+                            self:_doInstall(plugin_info, self._manifest)
+                        end)
+                    end,
+                },
+            }},
+        }
+        UIManager:show(viewer)
+    end
+
+    local cached = read_file(path)
+    if cached then return display(cached) end
+    when_online(function()
+        local notice = InfoMessage:new{ text = _("Fetching changelog\u{2026}") }
+        UIManager:show(notice)
+        UIManager:scheduleIn(0.2, function()
+            UIManager:close(notice)
+            local body, err = fetch_url(plugin_info.raw_base_url .. "CHANGELOG.md")
+            if not body then
+                UIManager:show(InfoMessage:new{
+                    text    = _("Changelog download failed:") .. "\n" .. (err or "?"),
+                    timeout = 5,
+                })
+                return
+            end
+            mkdir_p(path:match("^(.*)/"))
+            write_file(path, body)
+            display(body)
+        end)
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Screenshot preview
+-- ---------------------------------------------------------------------------
+
+-- The README screenshot shipped in the plugin's own images/ (see
+-- PMLogic.pickScreenshot), or nil when the manifest lists none.
+local function screenshot_of(plugin_info)
+    return PMLogic.pickScreenshot(plugin_info.id, plugin_info.files)
+end
+
+-- Decodes first, so a damaged file gives a message instead of an ImageViewer
+-- failing half-built. Returns false when the image cannot be shown.
+local function view_image(path, title)
+    local ok_r, RenderImage = pcall(require, "ui/renderimage")
+    local ok_v, ImageViewer = pcall(require, "ui/widget/imageviewer")
+    if not ok_r or not ok_v then return false end
+    local ok_bb, bb = pcall(RenderImage.renderImageFile, RenderImage, path, false)
+    if not ok_bb or not bb then return false end
+    local ok_new, viewer = pcall(ImageViewer.new, ImageViewer, {
+        image            = bb,
+        image_disposable = true,
+        fullscreen       = true,
+        with_title_bar   = true,
+        title_text       = title,
+    })
+    if not ok_new or not viewer then
+        bb:free()
+        return false
+    end
+    UIManager:show(viewer)
+    return true
+end
+
+-- An installed plugin already has the image on disk (it is one of its
+-- files); otherwise it is downloaded once into the cache, next to the
+-- READMEs, keyed by plugin and version.
+function PluginManager:showScreenshot(plugin_info)
+    local rel = screenshot_of(plugin_info)
+    if not rel then return end
+    local title = plugin_info.fullname
+
+    local plugin_dir = PathGuard.pluginPath(_plugins_dir, plugin_info.dir or "")
+    local on_disk    = plugin_dir and PathGuard.filePath(plugin_dir, rel)
+    local lfs        = get_lfs()
+    if on_disk and lfs and lfs.attributes(on_disk, "mode") == "file" and view_image(on_disk, title) then
+        return
+    end
+
+    local path = cache_path("shot_" .. plugin_info.id .. "_" .. tostring(plugin_info.version) .. ".png")
+    if lfs and lfs.attributes(path, "mode") == "file" then
+        if view_image(path, title) then return end
+        os.remove(path)  -- damaged: fetch it again below
+    end
+    if not plugin_info.raw_base_url then return end
+    when_online(function()
+        local notice = InfoMessage:new{ text = _("Fetching screenshot\u{2026}") }
+        UIManager:show(notice)
+        UIManager:scheduleIn(0.2, function()
+            UIManager:close(notice)
+            mkdir_p(path:match("^(.*)/"))
+            local ok, err = fetch_to_file(plugin_info.raw_base_url .. rel, path)
+            if not ok or not view_image(path, title) then
+                os.remove(path)
+                UIManager:show(InfoMessage:new{
+                    text    = _("Screenshot download failed:") .. "\n" .. (err or "?"),
+                    timeout = 5,
+                })
+            end
+        end)
+    end)
+end
+
+-- ---------------------------------------------------------------------------
 -- Per-plugin dialogs
 -- ---------------------------------------------------------------------------
 
@@ -1621,20 +2115,41 @@ function PluginManager:showInstalledDialog(plugin_info, inst_info, has_update)
         end,
     }}
 
-    if has_update then
-        local pref = plugin_info
+    local shot = screenshot_of(plugin_info)
+    if shot then
         buttons[#buttons + 1] = {{
-            text     = string.format(_("Update to v%s"), plugin_info.version),
+            text     = _("Screenshot"),
             callback = function()
                 UIManager:close(dlg)
-                self:_doInstall(pref, self._manifest)
+                self:showScreenshot(plugin_info)
             end,
         }}
+    end
+
+    if has_update then
+        local pref = plugin_info
+        buttons[#buttons + 1] = {
+            {
+                text     = string.format(_("Update to v%s"), plugin_info.version),
+                callback = function()
+                    UIManager:close(dlg)
+                    self:confirmCompatible(pref, function() self:_doInstall(pref, self._manifest) end)
+                end,
+            },
+            {
+                text     = _("What's new"),
+                callback = function()
+                    UIManager:close(dlg)
+                    self:showWhatsNew(pref, inst_info)
+                end,
+            },
+        }
         buttons[#buttons + 1] = {{
             text     = string.format(_("Ignore v%s"), plugin_info.version),
             callback = function()
                 UIManager:close(dlg)
                 self:setIgnoredVersion(pref.id, pref.version)
+                self:refreshHome()
                 UIManager:show(InfoMessage:new{
                     text    = string.format(
                         _("v%s will be hidden from updates until a newer version is released.\nSee \u{201c}Ignored updates\u{2026}\u{201d} in the main menu to undo."),
@@ -1659,12 +2174,33 @@ function PluginManager:showInstalledDialog(plugin_info, inst_info, has_update)
                 fullname     = inst_info.fullname,
                 version      = inst_info.version,
                 files        = pref.files,
+                sha256       = pref.sha256,
+                min_koreader = pref.min_koreader,
                 common_lib   = pref.common_lib,
                 raw_base_url = pref.raw_base_url,
             }
-            self:_doInstall(current, self._manifest)
+            self:confirmCompatible(current, function() self:_doInstall(current, self._manifest) end)
         end,
     }}
+
+    -- Roll back to the version the last update replaced, when one is kept.
+    local backup_version = self:getBackupVersion(plugin_info.dir)
+    if backup_version then
+        buttons[#buttons + 1] = {{
+            text     = string.format(_("Restore previous version (v%s)"), backup_version),
+            callback = function()
+                UIManager:close(dlg)
+                UIManager:show(ConfirmBox:new{
+                    text        = string.format(
+                        _("Replace %s v%s with the previous version, v%s?"),
+                        inst_info.fullname, inst_info.version, backup_version
+                    ),
+                    ok_text     = _("Restore"),
+                    ok_callback = function() self:_doRestore(plugin_info, inst_info) end,
+                })
+            end,
+        }}
+    end
 
     local iref = inst_info
     local pid  = plugin_info.id
@@ -1676,12 +2212,9 @@ function PluginManager:showInstalledDialog(plugin_info, inst_info, has_update)
             callback = function()
                 UIManager:close(dlg)
                 set_plugin_disabled(pid, not iref.disabled)
-                UIManager:show(InfoMessage:new{
-                    text    = iref.disabled
-                        and string.format(_("%s enabled.\nRestart KOReader to apply."), iref.fullname)
-                        or  string.format(_("%s disabled.\nRestart KOReader to apply."), iref.fullname),
-                    timeout = 5,
-                })
+                self:askRestart(iref.disabled
+                    and string.format(_("%s enabled.\nRestart KOReader to apply."), iref.fullname)
+                    or  string.format(_("%s disabled.\nRestart KOReader to apply."), iref.fullname))
             end,
         }}
     end
@@ -1717,6 +2250,9 @@ function PluginManager:showInstalledDialog(plugin_info, inst_info, has_update)
     if json_str(plugin_info.description) ~= "" then
         title = title .. "\n" .. json_str(plugin_info.description)
     end
+    if not self:isCompatible(plugin_info) then
+        title = title .. "\n" .. string.format(_("v%s needs KOReader %s or newer."), plugin_info.version, plugin_info.min_koreader)
+    end
 
     dlg = ButtonDialog:new{ title = title, buttons = buttons }
     UIManager:show(dlg)
@@ -1728,34 +2264,71 @@ function PluginManager:showAvailableDialog(plugin_info)
     if json_str(plugin_info.description) ~= "" then
         title = title .. "\n" .. json_str(plugin_info.description)
     end
-    dlg = ButtonDialog:new{
-        title   = title,
-        buttons = {
-            {{
-                text     = _("Install"),
-                callback = function()
-                    UIManager:close(dlg)
+    if not self:isCompatible(plugin_info) then
+        title = title .. "\n" .. string.format(_("Needs KOReader %s or newer."), plugin_info.min_koreader)
+    end
+    local buttons = {
+        {{
+            text     = _("Install"),
+            callback = function()
+                UIManager:close(dlg)
+                self:confirmCompatible(plugin_info, function()
                     self:_doInstall(plugin_info, self._manifest)
-                end,
-            }},
-            {{
-                text     = _("README\u{2026}"),
-                callback = function()
-                    UIManager:close(dlg)
-                    self:showReadme(
-                        plugin_info.raw_base_url and (plugin_info.raw_base_url .. "README.md") or nil,
-                        string.format(_("README: %s"), plugin_info.fullname),
-                        plugin_info.id
-                    )
-                end,
-            }},
-            {{
-                text     = _("Cancel"),
-                callback = function() UIManager:close(dlg) end,
-            }},
-        },
+                end)
+            end,
+        }},
+        {{
+            text     = _("README\u{2026}"),
+            callback = function()
+                UIManager:close(dlg)
+                self:showReadme(
+                    plugin_info.raw_base_url and (plugin_info.raw_base_url .. "README.md") or nil,
+                    string.format(_("README: %s"), plugin_info.fullname),
+                    plugin_info.id
+                )
+            end,
+        }},
     }
+    if screenshot_of(plugin_info) then
+        buttons[#buttons + 1] = {{
+            text     = _("Screenshot"),
+            callback = function()
+                UIManager:close(dlg)
+                self:showScreenshot(plugin_info)
+            end,
+        }}
+    end
+    buttons[#buttons + 1] = {{
+        text     = _("Cancel"),
+        callback = function() UIManager:close(dlg) end,
+    }}
+    dlg = ButtonDialog:new{ title = title, buttons = buttons }
     UIManager:show(dlg)
+end
+
+-- Restores the kept previous version and, if the manifest still offers the
+-- version just rolled back from (or newer), ignores it: otherwise the very
+-- next Update would reinstall what the user has just backed out of.
+function PluginManager:_doRestore(plugin_info, inst_info)
+    local ok, result = safe_call(function() return self:restoreBackup(plugin_info.dir) end)
+    if not ok then
+        UIManager:show(InfoMessage:new{
+            text    = _("Restore failed:") .. "\n" .. (result or "?"),
+            timeout = 5,
+        })
+        return
+    end
+    local parts = { string.format(_("%s v%s restored."), inst_info.fullname, result) }
+    if is_newer(result, plugin_info.version) then
+        self:setIgnoredVersion(plugin_info.id, plugin_info.version)
+        parts[#parts + 1] = string.format(
+            _("v%s will be hidden from updates until a newer version is released.\nSee \u{201c}Ignored updates\u{2026}\u{201d} in the main menu to undo."),
+            plugin_info.version
+        )
+    end
+    self:refreshHome()
+    parts[#parts + 1] = _("Please restart KOReader to apply the change.")
+    self:askRestart(table.concat(parts, "\n"))
 end
 
 -- Dialog for a plugin installed locally but absent from the manifest.
@@ -2031,44 +2604,122 @@ function PluginManager:cycleListSort()
     return next_mode
 end
 
+-- Category labels, by the stable ids update_manifest.py writes from
+-- .github/scripts/categories.json. A function, not a table built at load
+-- time, so the labels follow the UI language. Anything else -- no category
+-- (a manifest from before categories, a locally-installed plugin) or one
+-- this version does not know yet -- goes under "Other".
+local function category_label(id)
+    local labels = {
+        logic   = _("Logic puzzles"),
+        sudoku  = _("Sudoku"),
+        words   = _("Word games"),
+        board   = _("Board games"),
+        cards   = _("Card & dice games"),
+        classic = _("Classic puzzles"),
+        party   = _("Party & quiz"),
+        tools   = _("Utilities"),
+    }
+    return labels[id] or _("Other")
+end
+
+local function category_of(id)
+    for _i, known in ipairs(PMLogic.CATEGORY_ORDER) do
+        if known == id then return id end
+    end
+    return "other"
+end
+
+-- Picks the category the list is narrowed to (nil = all), then reopens it.
+function PluginManager:showCategoryFilterDialog()
+    local dlg
+    local function choose(id)
+        return function()
+            UIManager:close(dlg)
+            self._list_category = id
+            self:showPluginList()
+        end
+    end
+    local buttons = {{{ text = _("All categories"), callback = choose(nil) }}}
+    local ids = {}
+    for _i, id in ipairs(PMLogic.CATEGORY_ORDER) do ids[#ids + 1] = id end
+    ids[#ids + 1] = "other"
+    -- Two per row: nine single rows would not fit a small screen.
+    for i = 1, #ids, 2 do
+        local row = {}
+        for j = i, math.min(i + 1, #ids) do
+            local id = ids[j]
+            row[#row + 1] = {
+                text     = (self._list_category == id and "\u{2713} " or "") .. category_label(id),
+                callback = choose(id),
+            }
+        end
+        buttons[#buttons + 1] = row
+    end
+    dlg = ButtonDialog:new{ title = _("Show category"), buttons = buttons }
+    UIManager:show(dlg)
+end
+
 function PluginManager:showPluginListFilterDialog()
     local input
     input = InputDialog:new{
         title      = _("Filter plugins"),
         input      = self._list_filter or "",
         input_hint = _("Plugin name\u{2026}"),
-        buttons    = {{
+        buttons    = {
             {
-                text     = _("Clear"),
-                callback = function()
-                    UIManager:close(input)
-                    self._list_filter = nil
-                    self:showPluginList()
-                end,
+                {
+                    text     = string.format(_("Category: %s"),
+                        self._list_category and category_label(self._list_category) or _("All")),
+                    callback = function()
+                        -- Keep whatever was typed: picking a category is
+                        -- part of the same filter, not a cancel.
+                        local text = input:getInputText():match("^%s*(.-)%s*$")
+                        UIManager:close(input)
+                        self._list_filter = text ~= "" and text or nil
+                        self:showCategoryFilterDialog()
+                    end,
+                },
             },
             {
-                text     = _("Cancel"),
-                callback = function()
-                    UIManager:close(input)
-                    self:showPluginList()
-                end,
+                {
+                    text     = _("Clear"),
+                    callback = function()
+                        UIManager:close(input)
+                        self._list_filter   = nil
+                        self._list_category = nil
+                        self:showPluginList()
+                    end,
+                },
+                {
+                    text     = _("Cancel"),
+                    callback = function()
+                        UIManager:close(input)
+                        self:showPluginList()
+                    end,
+                },
+                {
+                    text             = _("Filter"),
+                    is_enter_default = true,
+                    callback         = function()
+                        local text = input:getInputText():match("^%s*(.-)%s*$")
+                        UIManager:close(input)
+                        self._list_filter = text ~= "" and text or nil
+                        self:showPluginList()
+                    end,
+                },
             },
-            {
-                text             = _("Filter"),
-                is_enter_default = true,
-                callback         = function()
-                    local text = input:getInputText():match("^%s*(.-)%s*$")
-                    UIManager:close(input)
-                    self._list_filter = text ~= "" and text or nil
-                    self:showPluginList()
-                end,
-            },
-        }},
+        },
     }
     UIManager:show(input)
     input:onShowKeyboard()
 end
 
+-- The list is split into one section per category (manifest field
+-- `category`), each opened by a non-selectable header row; the sort mode
+-- (name, or status with updates first) applies inside each section, and the
+-- name filter and category filter narrow it first. Offline -- no manifest
+-- cached yet -- there are no categories to go by and the list stays flat.
 function PluginManager:showPluginList()
     local Menu   = require("ui/widget/menu")
     local Screen = require("device").screen
@@ -2098,17 +2749,28 @@ function PluginManager:showPluginList()
         local known_ids = {}
         for _i, p in ipairs(self._manifest.plugins) do
             known_ids[p.id] = true
-            local inst = installed[p.id]
+            local inst       = installed[p.id]
+            local compatible = self:isCompatible(p)
+            local category   = category_of(json_str(p.category))
             if inst then
-                local has_update = is_newer(inst.version, p.version) and not self:isVersionIgnored(p.id, p.version)
-                local detail = has_update
-                    and ("v" .. inst.version .. " \u{2192} v" .. p.version)
-                    or  ("v" .. inst.version)
+                local newer      = is_newer(inst.version, p.version) and not self:isVersionIgnored(p.id, p.version)
+                -- An update this KOReader cannot run is shown, not offered
+                -- as one: not bold, not sorted first, and the reason given.
+                local has_update = newer and compatible
+                local detail
+                if has_update then
+                    detail = "v" .. inst.version .. " \u{2192} v" .. p.version
+                elseif newer then
+                    detail = "v" .. inst.version .. "  " .. string.format(_("(v%s needs KOReader %s)"), p.version, p.min_koreader)
+                else
+                    detail = "v" .. inst.version
+                end
                 local entry = { plugin = p, inst = inst, has_update = has_update }
                 items[#items + 1] = {
                     text        = (inst.disabled and (_("[DISABLED]") .. " ") or "") .. inst.fullname,
                     mandatory   = detail,
                     bold        = has_update,
+                    category    = category,
                     _sort_group = has_update and SORT_GROUP_UPDATE or SORT_GROUP_INSTALLED,
                     callback    = function()
                         self:showInstalledDialog(entry.plugin, entry.inst, entry.has_update)
@@ -2118,8 +2780,10 @@ function PluginManager:showPluginList()
                 local pref = p
                 items[#items + 1] = {
                     text        = p.fullname,
-                    mandatory   = "v" .. p.version,
+                    mandatory   = compatible and ("v" .. p.version)
+                        or ("v" .. p.version .. "  " .. string.format(_("(needs KOReader %s)"), p.min_koreader)),
                     dim         = true,
+                    category    = category,
                     _sort_group = SORT_GROUP_AVAILABLE,
                     callback    = function() self:showAvailableDialog(pref) end,
                 }
@@ -2142,6 +2806,7 @@ function PluginManager:showPluginList()
                     text        = (inst.disabled and (_("[DISABLED]") .. " ") or "") .. inst.fullname,
                     mandatory   = detail,
                     bold        = has_update,
+                    category    = "other",
                     _sort_group = has_update and SORT_GROUP_UPDATE or SORT_GROUP_LOCAL_ONLY,
                     callback    = function() self:showLocalOnlyDialog(iref) end,
                 }
@@ -2150,10 +2815,11 @@ function PluginManager:showPluginList()
     end
 
     local filter = (self._list_filter or ""):lower()
-    if filter ~= "" then
+    if filter ~= "" or self._list_category then
         local filtered = {}
         for _, item in ipairs(items) do
-            if item.text:lower():find(filter, 1, true) then
+            if (filter == "" or item.text:lower():find(filter, 1, true))
+               and (not self._list_category or (item.category or "other") == self._list_category) then
                 filtered[#filtered + 1] = item
             end
         end
@@ -2169,10 +2835,35 @@ function PluginManager:showPluginList()
         table.sort(items, function(a, b) return a.text < b.text end)
     end
 
+    -- Sections. Not when the list is narrowed to one category (the subtitle
+    -- already names it), offline, or with a manifest from before categories
+    -- existed (nothing to group by: one "Other" header over everything).
+    local has_categories = false
+    for _i, p in ipairs(self._manifest and self._manifest.plugins or {}) do
+        if json_str(p.category) ~= "" then has_categories = true break end
+    end
+    if has_categories and not self._list_category then
+        local grouped = {}
+        for _i, group in ipairs(PMLogic.groupByCategory(items)) do
+            grouped[#grouped + 1] = {
+                text           = "\u{25B8} " .. category_label(group.id),
+                mandatory      = tostring(#group.items),
+                bold           = true,
+                select_enabled = false,
+            }
+            for _j, item in ipairs(group.items) do grouped[#grouped + 1] = item end
+        end
+        items = grouped
+    end
+
+    local subtitle_parts = {}
+    if self._list_category then subtitle_parts[#subtitle_parts + 1] = category_label(self._list_category) end
+    if filter ~= "" then subtitle_parts[#subtitle_parts + 1] = string.format(_("Filter: %s"), self._list_filter) end
+
     local menu_instance
     menu_instance = Menu:new{
         title               = _("Plugins"),
-        subtitle            = filter ~= "" and string.format(_("Filter: %s"), self._list_filter) or nil,
+        subtitle            = #subtitle_parts > 0 and table.concat(subtitle_parts, " \u{00B7} ") or nil,
         item_table          = items,
         width               = Screen:getWidth(),
         height              = Screen:getHeight(),
@@ -2194,8 +2885,9 @@ function PluginManager:showPluginList()
         end,
     }
     function menu_instance:onMenuChoice(item)
+        if not item.callback then return end  -- a section header
         UIManager:close(self)
-        if item.callback then item.callback() end
+        item.callback()
     end
     UIManager:show(menu_instance)
 end
@@ -2229,13 +2921,54 @@ function PluginManager:_fetchManifest()
     return manifest
 end
 
--- Shared by doFullUpdate and doFullReinstall: refreshes every shared
+-- The end of every bulk run: its summary lines, and -- when anything was
+-- written -- the restart offer, asked once for the whole batch.
+--
+-- KOReader only loads plugin Lua at startup (see is_plugin_disabled above --
+-- there is no live reload), so every file written by a run is inert until a
+-- restart. This prompt used to be shown only when Plugin Manager had updated
+-- *itself*, which meant a bulk run that updated thirty games ended on a bare
+-- "30 plugin(s) updated" and nothing said the new code wasn't live yet: the
+-- user opened a game, got the previous version's behaviour, and reasonably
+-- concluded the update had not been delivered.
+function PluginManager:_showSummary(parts, needs_restart, has_self)
+    if has_self then
+        parts[#parts + 1] = _("Please restart KOReader to apply the Plugin Manager update.")
+    elseif needs_restart then
+        parts[#parts + 1] = _("Please restart KOReader to apply the update.")
+    end
+    if has_self or needs_restart then
+        self:askRestart(table.concat(parts, "\n"))
+    else
+        UIManager:show(InfoMessage:new{ text = table.concat(parts, "\n"), timeout = 6 })
+    end
+end
+
+-- Lists the entries of `plugins` this KOReader can run, and the names of the
+-- ones it cannot (min_koreader): bulk runs skip those and say so in their
+-- summary instead of installing something that will not load.
+function PluginManager:_splitCompatible(plugins)
+    local ok, skipped = {}, {}
+    for _i, p in ipairs(plugins) do
+        if self:isCompatible(p) then
+            ok[#ok + 1] = p
+        else
+            skipped[#skipped + 1] = string.format("%s (KOReader %s)", p.fullname or p.id, p.min_koreader)
+        end
+    end
+    return ok, skipped
+end
+
+-- Shared by doFullUpdate, doFullReinstall and Import: refreshes every shared
 -- library referenced by `to_process` (or already installed), then installs
 -- each plugin in `to_process` one at a time with progress feedback.
 -- `opts` lets callers customise the three user-facing strings without
 -- duplicating this whole flow: nothing_to_do_text, done_text (takes one
 -- %d, the count), progress_text (same). `opts.force_common` re-fetches the
 -- shared libraries even when their .version stamp is already current.
+-- `opts.skipped` lists plugins left out for needing a newer KOReader, for
+-- the summary. `opts.on_done(parts, succeeded, has_self)`, if given, gets the
+-- summary instead of it being shown (Import appends its GitHub installs).
 function PluginManager:_runBulkInstall(manifest, to_process, opts)
     opts = opts or {}
     local installed = self:scanInstalled()
@@ -2267,6 +3000,12 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
         end
     end
 
+    local function skipped_line(parts)
+        if opts.skipped and #opts.skipped > 0 then
+            parts[#parts + 1] = string.format(_("Skipped, needs a newer KOReader: %s"), table.concat(opts.skipped, ", "))
+        end
+    end
+
     if #to_process == 0 then
         local removed_renamed = safe_call(function() return self:_cleanupRenamed(manifest) end) or {}
         local parts = {}
@@ -2274,6 +3013,9 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
         for _i, fullname in ipairs(removed_renamed) do
             parts[#parts + 1] = string.format(_("Removed superseded %s."), fullname)
         end
+        skipped_line(parts)
+        self:refreshHome()
+        if opts.on_done then return opts.on_done(parts, 0, false) end
         UIManager:show(InfoMessage:new{
             text    = table.concat(parts, "\n"),
             timeout = 4,
@@ -2298,25 +3040,11 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
         for _i, fullname in ipairs(removed_renamed) do
             parts[#parts + 1] = string.format(_("Removed superseded %s."), fullname)
         end
-        -- KOReader only loads plugin Lua at startup (see is_plugin_disabled
-        -- above -- there is no live reload), so every file written by this
-        -- run is inert until a restart. This prompt used to be shown only
-        -- when Plugin Manager had updated *itself*, which meant a bulk run
-        -- that updated thirty games ended on a bare "30 plugin(s) updated"
-        -- and nothing said the new code wasn't live yet: the user opened a
-        -- game, got the previous version's behaviour, and reasonably
-        -- concluded the update had not been delivered. The single-plugin
-        -- install path has always prompted; the bulk path now matches it.
+        skipped_line(parts)
         local succeeded = total - #failed
-        if has_self then
-            parts[#parts + 1] = _("Please restart KOReader to apply the Plugin Manager update.")
-        elseif succeeded > 0 then
-            parts[#parts + 1] = _("Please restart KOReader to apply the update.")
-        end
-        UIManager:show(InfoMessage:new{
-            text    = table.concat(parts, "\n"),
-            timeout = (has_self or succeeded > 0) and 10 or 6,
-        })
+        self:refreshHome()
+        if opts.on_done then return opts.on_done(parts, succeeded, has_self) end
+        self:_showSummary(parts, succeeded > 0, has_self)
     end
 
     local function step(i)
@@ -2413,17 +3141,24 @@ function PluginManager:_doFullUpdate()
         local manifest = self:_fetchManifest()
         if not manifest then return end
 
-        local installed  = self:scanInstalled()
-        local to_process = {}
+        -- Updates (the same list the home screen counts), plus every plugin
+        -- not installed yet -- Update has always installed the whole
+        -- catalogue. Anything needing a newer KOReader is skipped and named.
+        local installed        = self:scanInstalled()
+        local updates, blocked = self:pendingUpdates(manifest, installed)
+        local candidates       = {}
         for _, p in ipairs(manifest.plugins) do
-            local inst = installed[p.id]
-            if not inst or (is_newer(inst.version, p.version) and not self:isVersionIgnored(p.id, p.version)) then
-                to_process[#to_process + 1] = p
-            end
+            if not installed[p.id] then candidates[#candidates + 1] = p end
         end
+        local new_ok, new_skipped = self:_splitCompatible(candidates)
+        local to_process = {}
+        for _, p in ipairs(updates) do to_process[#to_process + 1] = p end
+        for _, p in ipairs(new_ok)  do to_process[#to_process + 1] = p end
+        local _ok, skipped = self:_splitCompatible(blocked)
+        for _, name in ipairs(new_skipped) do skipped[#skipped + 1] = name end
 
         self:_refreshDiscoverLinkedVersions(installed, function()
-            self:_runBulkInstall(manifest, to_process)
+            self:_runBulkInstall(manifest, to_process, { skipped = skipped })
         end)
     end)
 end
@@ -2493,6 +3228,7 @@ function PluginManager:_doRemoveAll()
         local total = #to_remove
         local function step(i)
             if i > total then
+                self:refreshHome()
                 UIManager:show(InfoMessage:new{
                     text    = string.format(_("%d plugin(s) removed."), total),
                     timeout = 5,
@@ -2502,6 +3238,8 @@ function PluginManager:_doRemoveAll()
             local inst = to_remove[i]
             local inst_path = PathGuard.pluginPath(_plugins_dir, inst.dir)
             if inst_path then rm_rf(inst_path) end
+            local backup = backup_path(inst.dir)
+            if backup then rm_rf(backup) end
             UIManager:scheduleIn(0, function() step(i + 1) end)
         end
         step(1)
@@ -2517,18 +3255,22 @@ function PluginManager:_doFullReinstall()
         if not manifest then return end
 
         local installed  = self:scanInstalled()
-        local to_process = {}
+        local candidates = {}
         for _, p in ipairs(manifest.plugins) do
             if installed[p.id] then
-                to_process[#to_process + 1] = p
+                candidates[#candidates + 1] = p
             end
         end
+        -- Reinstall fetches the manifest's (latest) version, so the same
+        -- KOReader requirement applies as for an update.
+        local to_process, skipped = self:_splitCompatible(candidates)
 
         self:_runBulkInstall(manifest, to_process, {
             nothing_to_do_text = _("No plugins installed."),
             done_text          = _("%d plugin(s) reinstalled."),
             progress_text      = _("Reinstalling %d plugin(s)\u{2026}"),
             force_common       = true,
+            skipped            = skipped,
         })
     end)
 end
@@ -2731,10 +3473,7 @@ function PluginManager:_doInstallPatch(item)
         UIManager:close(msg)
         local ok, err = safe_call(function() return self:installPatchFile(item) end)
         if ok then
-            UIManager:show(InfoMessage:new{
-                text    = string.format(_("%s installed.\nRestart KOReader to apply."), item.name),
-                timeout = 6,
-            })
+            self:askRestart(string.format(_("%s installed.\nRestart KOReader to apply."), item.name))
         else
             logger.warn("PluginManager: patch install failed for", item.name, ":", err)
             UIManager:show(InfoMessage:new{
@@ -2764,10 +3503,16 @@ function PluginManager:installAllPatches(items)
             if #failed > 0 then
                 parts[#parts + 1] = string.format(_("%d/%d installed. Failures:"), total - #failed, total)
                 for _, f in ipairs(failed) do parts[#parts + 1] = f end
+                if #failed < total then
+                    parts[#parts + 1] = _("Restart KOReader to apply.")
+                    self:askRestart(table.concat(parts, "\n"))
+                else
+                    UIManager:show(InfoMessage:new{ text = table.concat(parts, "\n"), timeout = 8 })
+                end
             else
                 parts[#parts + 1] = string.format(_("%d patch(es) installed.\nRestart KOReader to apply."), total)
+                self:askRestart(table.concat(parts, "\n"))
             end
-            UIManager:show(InfoMessage:new{ text = table.concat(parts, "\n"), timeout = 8 })
             return
         end
         local item = items[i]
@@ -3143,12 +3888,9 @@ function PluginManager:showInstalledPatchDialog(iref)
         callback = function()
             UIManager:close(dlg)
             self:setPatchDisabled(iref.name, not iref.disabled)
-            UIManager:show(InfoMessage:new{
-                text    = iref.disabled
-                    and string.format(_("%s enabled.\nRestart KOReader to apply."), iref.name)
-                    or  string.format(_("%s disabled.\nRestart KOReader to apply."), iref.name),
-                timeout = 5,
-            })
+            self:askRestart(iref.disabled
+                and string.format(_("%s enabled.\nRestart KOReader to apply."), iref.name)
+                or  string.format(_("%s disabled.\nRestart KOReader to apply."), iref.name))
         end,
     }}
 
@@ -3225,51 +3967,36 @@ end
 -- ---------------------------------------------------------------------------
 
 function PluginManager:showPatchesMainDialog()
-    local dlg
     local ok_up, userpatch = pcall(require, "userpatch")
     local all_disabled = ok_up and userpatch.arePatchesDisabled and userpatch.arePatchesDisabled()
-    local title = _("Patches")
-    if ok_up then
-        title = title .. "\n" .. (all_disabled and _("All patches: OFF") or _("All patches: ON"))
-    end
 
-    local buttons = {}
-    buttons[#buttons + 1] = {{
-        text     = _("Installed patches"),
-        callback = function()
-            UIManager:close(dlg)
-            self:showInstalledPatchesList()
-        end,
-    }}
-    buttons[#buttons + 1] = {{
-        text     = _("Discover patches\u{2026}"),
-        callback = function()
-            UIManager:close(dlg)
-            self:showDiscoverPatchesDialog()
-        end,
-    }}
+    local entries = {
+        { text = _("Installed patches"),       callback = function() self:showInstalledPatchesList() end },
+        { text = _("Discover patches\u{2026}"), callback = function() self:showDiscoverPatchesDialog() end },
+    }
     if ok_up and userpatch.togglePatchesDisabled then
-        buttons[#buttons + 1] = {{
+        entries[#entries + 1] = {
             text     = all_disabled and _("Enable all patches") or _("Disable all patches"),
+            -- The label and the subtitle both change: rebuild the screen.
+            reopen   = true,
             callback = function()
-                UIManager:close(dlg)
                 userpatch.togglePatchesDisabled()
-                UIManager:show(InfoMessage:new{
-                    text    = all_disabled
-                        and _("All patches enabled.\nRestart KOReader to apply.")
-                        or  _("All patches disabled.\nRestart KOReader to apply."),
-                    timeout = 5,
-                })
+                -- askRestart lands on the next tick, so it shows on top of
+                -- this screen once rebuilt.
+                self:askRestart(all_disabled
+                    and _("All patches enabled.\nRestart KOReader to apply.")
+                    or  _("All patches disabled.\nRestart KOReader to apply."))
             end,
-        }}
+        }
     end
-    buttons[#buttons + 1] = {{
-        text     = _("Close"),
-        callback = function() UIManager:close(dlg) end,
-    }}
 
-    dlg = ButtonDialog:new{ title = title, buttons = buttons }
-    UIManager:show(dlg)
+    local subtitle
+    if ok_up then
+        subtitle = all_disabled and _("All patches: OFF") or _("All patches: ON")
+    end
+    self:showScreenMenu(_("Patches"), subtitle, entries, function()
+        self:showPatchesMainDialog()
+    end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -3290,78 +4017,244 @@ function PluginManager:wifiStatusLine()
     return _("\u{2717} Wi-Fi off")
 end
 
-function PluginManager:showMainDialog()
-    local dlg
-    local title = _("Plugin Manager")
-    local wifi_status = self:wifiStatusLine()
-    if wifi_status then title = title .. "\n" .. wifi_status end
-    dlg = ButtonDialog:new{
-        title   = title,
-        buttons = {
-            {{
-                text     = _("Update"),
-                callback = function()
-                    UIManager:close(dlg)
-                    self:doFullUpdate()
-                end,
-            }},
-            {{
-                text     = _("Reinstall all\u{2026}"),
-                callback = function()
-                    UIManager:close(dlg)
-                    UIManager:show(ConfirmBox:new{
-                        text        = _("Reinstall every installed plugin?\nThis re-downloads all their files, including shared libraries."),
-                        ok_text     = _("Reinstall all"),
-                        ok_callback = function() self:doFullReinstall() end,
-                    })
-                end,
-            }},
-            {{
-                text     = _("Remove all\u{2026}"),
-                callback = function()
-                    UIManager:close(dlg)
-                    UIManager:show(ConfirmBox:new{
-                        text        = _("Remove every plugin managed by Plugin Manager?\nAll their files will be deleted. Plugin Manager itself and any other plugin on your device (including KOReader's own) are left untouched."),
-                        ok_text     = _("Remove all"),
-                        ok_callback = function() self:doRemoveAll() end,
-                    })
-                end,
-            }},
-            {{
-                text     = _("Plugin list"),
-                callback = function()
-                    UIManager:close(dlg)
-                    self:showPluginList()
-                end,
-            }},
-            {{
-                text     = _("Discover plugins\u{2026}"),
-                callback = function()
-                    UIManager:close(dlg)
-                    self:showDiscoverDialog()
-                end,
-            }},
-            {{
-                text     = _("Patches\u{2026}"),
-                callback = function()
-                    UIManager:close(dlg)
-                    self:showPatchesMainDialog()
-                end,
-            }},
-            {{
-                text     = _("Ignored updates\u{2026}"),
-                callback = function()
-                    UIManager:close(dlg)
-                    self:showIgnoredDialog()
-                end,
-            }},
-            {{
-                text     = _("Close"),
-                callback = function() UIManager:close(dlg) end,
-            }},
-        },
+-- A full-screen menu, like the plugin list and like every game in the fleet,
+-- rather than a pop-up. entries are { text, callback [, reopen] }. A chosen
+-- entry opens on top of it, so closing a list comes back here instead of
+-- dropping out to the book; an entry marked `reopen` changes this screen's own
+-- labels, so the screen is closed and `rebuild` builds it afresh.
+local function screen_menu_items(entries)
+    local items = {}
+    for _i, entry in ipairs(entries) do
+        items[#items + 1] = { text = entry.text, entry = entry }
+    end
+    return items
+end
+
+function PluginManager:showScreenMenu(title, subtitle, entries, rebuild)
+    local Menu   = require("ui/widget/menu")
+    local Screen = require("device").screen
+
+    local items = screen_menu_items(entries)
+
+    local menu_instance = Menu:new{
+        title      = title,
+        subtitle   = subtitle,
+        item_table = items,
+        width      = Screen:getWidth(),
+        height     = Screen:getHeight(),
     }
-    UIManager:show(dlg)
+    function menu_instance:onMenuChoice(item)
+        local entry = item.entry
+        if entry.reopen then
+            UIManager:close(self)
+            entry.callback()
+            if rebuild then rebuild() end
+        else
+            entry.callback()
+        end
+    end
+    UIManager:show(menu_instance)
+    return menu_instance
+end
+
+-- "Update", or "Update (3)" when the cached manifest already shows three
+-- updates (the same count pendingUpdates gives the Update button). Read from
+-- the cache and a local scan only: opening the home screen never touches
+-- the network.
+function PluginManager:updateEntryText()
+    local n = #self:pendingUpdates(self._manifest)
+    if n > 0 then return string.format(_("Update (%d)"), n) end
+    return _("Update")
+end
+
+function PluginManager:homeEntries()
+    return {
+        { text = self:updateEntryText(), callback = function() self:doFullUpdate() end },
+        {
+            text     = _("Reinstall all\u{2026}"),
+            callback = function()
+                UIManager:show(ConfirmBox:new{
+                    text        = _("Reinstall every installed plugin?\nThis re-downloads all their files, including shared libraries."),
+                    ok_text     = _("Reinstall all"),
+                    ok_callback = function() self:doFullReinstall() end,
+                })
+            end,
+        },
+        {
+            text     = _("Remove all\u{2026}"),
+            callback = function()
+                UIManager:show(ConfirmBox:new{
+                    text        = _("Remove every plugin managed by Plugin Manager?\nAll their files will be deleted. Plugin Manager itself and any other plugin on your device (including KOReader's own) are left untouched."),
+                    ok_text     = _("Remove all"),
+                    ok_callback = function() self:doRemoveAll() end,
+                })
+            end,
+        },
+        { text = _("Plugin list"),                   callback = function() self:showPluginList() end },
+        { text = _("Discover plugins\u{2026}"),       callback = function() self:showDiscoverDialog() end },
+        { text = _("Patches\u{2026}"),                callback = function() self:showPatchesMainDialog() end },
+        { text = _("Ignored updates\u{2026}"),        callback = function() self:showIgnoredDialog() end },
+        { text = _("Export installed list"),           callback = function() self:exportInstalled() end },
+        { text = _("Import list\u{2026}"),             callback = function() self:confirmImport() end },
+    }
+end
+
+function PluginManager:showMainDialog()
+    local menu = self:showScreenMenu(_("Plugin Manager"), self:wifiStatusLine(), self:homeEntries())
+    -- Remembered while it is open, so an install, update, ignore or remove
+    -- made from a screen above it can refresh its update count in place.
+    self._home_menu = menu
+    local pm = self
+    local orig_close = menu.onCloseWidget
+    function menu:onCloseWidget()
+        if pm._home_menu == self then pm._home_menu = nil end
+        if orig_close then return orig_close(self) end
+    end
+end
+
+-- Recounts updates on the home screen, if it is open. Cheap -- cached
+-- manifest plus a local scan -- and silent on any error: a stale label must
+-- never break the action that triggered the refresh.
+function PluginManager:refreshHome()
+    local menu = self._home_menu
+    if not menu then return end
+    pcall(function()
+        menu:switchItemTable(nil, screen_menu_items(self:homeEntries()), -1)
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Export / import of the installed list
+-- ---------------------------------------------------------------------------
+
+-- JSON, in KOReader's data directory (next to settings/ and plugins/), so it
+-- is easy to find over USB and to copy to another reader: a person can read
+-- it, and it holds no settings, only what to install (see PMLogic.buildExport).
+local EXPORT_FILE = "pluginmanager-export.json"
+
+local function export_path()
+    return DataStorage:getDataDir() .. "/" .. EXPORT_FILE
+end
+
+function PluginManager:exportInstalled()
+    if not self._manifest then
+        UIManager:show(InfoMessage:new{
+            text    = _("Press Update once first: the export needs the plugin list."),
+            timeout = 5,
+        })
+        return
+    end
+    self:ensureSettings()
+    local data = PMLogic.buildExport(
+        self:scanInstalled(),
+        self._manifest.plugins,
+        self.settings:readSetting("discover_installs") or {},
+        os.date("%Y-%m-%d")
+    )
+    local ok, err = write_file(export_path(), PMLogic.encodeJson(data) .. "\n")
+    if not ok then
+        UIManager:show(InfoMessage:new{
+            text    = _("Export failed:") .. "\n" .. tostring(err),
+            timeout = 5,
+        })
+        return
+    end
+    UIManager:show(InfoMessage:new{
+        text    = string.format(_("%d plugin(s) exported to:\n%s\nCopy this file to the same place on another reader, then use Import there."),
+            #data.plugins + #data.github, export_path()),
+        timeout = 10,
+    })
+end
+
+-- Reads the export file, fetches the live manifest and shows what would be
+-- installed before anything is. Installs go through the bulk path
+-- (_runBulkInstall: per-plugin safe_call, one summary, one restart prompt),
+-- then any GitHub-linked plugins through installAllFromGithub.
+function PluginManager:confirmImport()
+    local body = read_file(export_path())
+    if not body then
+        UIManager:show(InfoMessage:new{
+            text    = string.format(_("No export file found at:\n%s\nUse \u{201c}Export installed list\u{201d} on the other reader and copy the file here."), export_path()),
+            timeout = 8,
+        })
+        return
+    end
+    local data = parse_json(body)
+    if type(data) ~= "table" or data.format ~= PMLogic.EXPORT_FORMAT then
+        UIManager:show(InfoMessage:new{
+            text    = string.format(_("%s is not a Plugin Manager export."), export_path()),
+            timeout = 6,
+        })
+        return
+    end
+    when_online(function()
+        local notice = InfoMessage:new{ text = _("Fetching plugin list\u{2026}") }
+        UIManager:show(notice)
+        UIManager:scheduleIn(0.2, function()
+            UIManager:close(notice)
+            local manifest = self:_fetchManifest()
+            if not manifest then return end
+            local plan = PMLogic.planImport(data, manifest.plugins, self:scanInstalled())
+            if not plan then
+                UIManager:show(InfoMessage:new{
+                    text    = string.format(_("%s is not a Plugin Manager export."), export_path()),
+                    timeout = 6,
+                })
+                return
+            end
+            local to_install, skipped = self:_splitCompatible(plan.install)
+            if #to_install == 0 and #plan.github == 0 then
+                local parts = { _("Nothing to import: every plugin in the list is already installed.") }
+                if #plan.unknown > 0 then
+                    parts[#parts + 1] = string.format(_("No longer in the repository: %s"), table.concat(plan.unknown, ", "))
+                end
+                if #skipped > 0 then
+                    parts[#parts + 1] = string.format(_("Skipped, needs a newer KOReader: %s"), table.concat(skipped, ", "))
+                end
+                UIManager:show(InfoMessage:new{ text = table.concat(parts, "\n"), timeout = 6 })
+                return
+            end
+            local names = {}
+            for _i, p in ipairs(to_install) do names[#names + 1] = p.fullname end
+            for _i, r in ipairs(plan.github) do names[#names + 1] = r.full_name .. " (GitHub)" end
+            local parts = { string.format(_("Install %d plugin(s)?"), #names), table.concat(names, ", ") }
+            if #plan.present > 0 then
+                parts[#parts + 1] = string.format(_("Already installed, left as is: %d"), #plan.present)
+            end
+            if #plan.unknown > 0 then
+                parts[#parts + 1] = string.format(_("No longer in the repository: %s"), table.concat(plan.unknown, ", "))
+            end
+            if #skipped > 0 then
+                parts[#parts + 1] = string.format(_("Skipped, needs a newer KOReader: %s"), table.concat(skipped, ", "))
+            end
+            if #plan.github > 0 then
+                parts[#parts + 1] = _("GitHub plugins are third-party code \u{2014} only install plugins you trust.")
+            end
+            UIManager:show(ConfirmBox:new{
+                text        = table.concat(parts, "\n"),
+                ok_text     = _("Install"),
+                ok_callback = function() self:_runImport(manifest, to_install, plan.github, skipped) end,
+            })
+        end)
+    end)
+end
+
+function PluginManager:_runImport(manifest, to_install, github, skipped)
+    self:_runBulkInstall(manifest, to_install, {
+        nothing_to_do_text = _("No plugin to install from the repository."),
+        done_text          = _("%d plugin(s) installed."),
+        progress_text      = _("Installing %d plugin(s)\u{2026}"),
+        skipped            = skipped,
+        on_done            = function(parts, succeeded, has_self)
+            if #github == 0 then
+                return self:_showSummary(parts, succeeded > 0, has_self)
+            end
+            self:installAllFromGithub(github, function(gparts, gsucceeded)
+                for _i, line in ipairs(gparts) do parts[#parts + 1] = line end
+                self:_showSummary(parts, succeeded + gsucceeded > 0, has_self)
+            end)
+        end,
+    })
 end
 
 -- ---------------------------------------------------------------------------

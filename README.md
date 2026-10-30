@@ -16,6 +16,15 @@ A plugin manager for [KOReader](https://github.com/koreader/koreader) that lets 
 - **Search & sort** — filter the plugin list by name, or sort by name/status (tap the magnifier to filter, hold it to change sort)
 - **Discover plugins** — search GitHub for third-party KOReader plugins (tagged `koreader-plugin`) and install them directly, outside the koreader-plugins repository
 - **Patches** — discover, install, update, disable/enable, and remove KOReader user patches (`koreader/patches/`) from GitHub, the same way appstore.koplugin does
+- **Restart now** — every change that needs a restart (install, update, enable/disable, patches, restore) offers KOReader's own *Restart now / Restart later* box; a bulk run asks once, at the end
+- **Update count** — the home screen's **Update** entry shows how many updates are waiting, e.g. *Update (3)*, from the cached plugin list (no network when opening the home screen)
+- **Screenshot** — preview a plugin's screenshot before installing it
+- **What's new** — before updating, read only the changelog entries between your version and the new one
+- **Categories** — the plugin list is split into sections (logic puzzles, sudoku, word games, board games…), with a category filter
+- **Restore previous version** — an update keeps the version it replaced, one tap brings it back
+- **Integrity check** — every downloaded file is checked against the plugin list's SHA-256, and every `.lua` must compile, before anything is installed
+- **Minimum KOReader version** — a plugin that needs a newer KOReader is flagged, asks before installing, and is skipped by bulk updates
+- **Export / import** — save the list of installed plugins to a file and reinstall the same set on another reader
 
 ## Installation
 
@@ -48,8 +57,13 @@ Open **Tools → Plugin Manager**.
 | Ignore a specific update for a `(GitHub)` plugin | In the **Check for update** dialog → **Ignore vX.Y** (undo from **Ignored updates…**, same as manifest plugins) |
 | Link a `(local)` plugin to a GitHub repo, to enable update checks | Tap it in the plugin list → **Link to GitHub repo…** → enter `owner/repo`, or **Search GitHub…** to pick one from a live search instead of typing it |
 | Undo a link | Tap a `(GitHub)` plugin → **Unlink** (it becomes `(local)` again; files are untouched) |
+| See a plugin before installing it | Tap it → **Screenshot** (shown when the plugin ships one in `images/`) |
+| See what an update changes | Tap a plugin showing `v1.0 → v1.1` → **What's new** |
+| Show one category only | Tap the magnifier → **Category: …** |
+| Undo the last update of a plugin | Tap it → **Restore previous version (vX)** |
+| Copy your plugin set to another reader | **Export installed list** here, copy the file, **Import list…** there |
 
-After installing, updating, removing, or (de)disabling a plugin, **restart KOReader** for the change to take effect.
+After installing, updating, removing, or (de)disabling a plugin, **restart KOReader** for the change to take effect. Plugin Manager offers to do it for you (*Restart now*); on a device that cannot restart itself it says so instead.
 
 ### Sections (Plugin list)
 
@@ -58,6 +72,10 @@ After installing, updating, removing, or (de)disabling a plugin, **restart KORea
 | *Installed* | Plugins found both locally and in the repository. Shows a `→ vX.Y` arrow when an update is available, and a `[DISABLED]` tag when disabled. |
 | *Installed (not in repo)* | Plugins installed locally that are not listed in the repository. Tagged `(GitHub)` and offered **Check for update**/**README…**/**Unlink**/**Remove** if a source repo is known (installed via Discover, or manually linked); tagged `(local)` and offered **Link to GitHub repo…**/**Remove** otherwise. |
 | *Available* | Plugins in the repository that are not yet installed. |
+
+The list itself is split into one section per category — *Logic puzzles*, *Sudoku*, *Word games*, *Board games*, *Card & dice games*, *Classic puzzles*, *Party & quiz*, *Utilities* — each opened by a header row with its plugin count. Plugins without a category (locally-installed or GitHub plugins, or anything the repository has not categorised yet) go under *Other*. The name/status sort applies inside each section, and the search box narrows the whole list as before; **Category: …** in the same search dialog shows a single category. With a plugin list from before categories existed, the list stays flat.
+
+A plugin whose new version needs a newer KOReader than yours shows `(vX needs KOReader YYYY.MM)` instead of an update arrow, and an available one `(needs KOReader YYYY.MM)`.
 
 ## How it works
 
@@ -70,6 +88,30 @@ listed in `manifest.json`, or an entry inside a downloaded archive, names where
 it wants to land, and one naming a place outside the plugin's own directory is
 refused rather than written. The same check covers deletion, so a plugin entry
 can neither escape the plugins folder nor remove anything beside it.
+
+### Installing safely: staging, compile check, SHA-256
+
+A plugin is never written over the installed one file by file. Every file is first downloaded into `plugins/.pluginmanager-staging/<plugin>/` and checked; only when all of them pass are they moved into place. A failed download or check leaves the installed version exactly as it was — no half-installed plugin that KOReader then fails to load.
+
+The checks:
+
+- **Every `.lua` must compile** (it is compiled, not run). This alone catches a truncated download, whatever the plugin list says.
+- **SHA-256**, when the plugin list carries hashes (`sha256`, one per file, written by `update_manifest.py`). A file that fails either check is downloaded once more before anything is concluded.
+- **Drift is not an error.** Files come from GitHub at the tip of each plugin's branch, while the hashes were computed when the plugin list was last regenerated. Between a plugin being pushed and the list being regenerated, the two legitimately differ. So a hash mismatch that survives the second download is accepted when the plugin's own `_meta.lua`, as downloaded, is **at least** the version the list announces (the plugin moved ahead of the list), and refused when it is **older** (a stale copy, e.g. a wrong branch that GitHub still serves). Drift therefore never blocks a good install.
+- **Shared libraries** (`game-common`, `sudoku-common`) have no `_meta.lua` to tell those two cases apart: a mismatched `.lua` that compiles is accepted (it is what a library pushed before the list was regenerated looks like), anything else is refused. All their files are downloaded and checked before the first one is written.
+- A plugin list without hashes (older lists, or a file missing from the map) installs exactly as before, with the compile check only.
+
+The SHA-256 comes from KOReader's own `ffi/sha2`; if it cannot be loaded, hashing is skipped (never the install).
+
+### Restore previous version
+
+Updating a plugin to a different version first copies the installed one to `plugins/.pluginmanager-backup/<plugin>/` — one copy per plugin, the version before the last update (reinstalling the same version does not overwrite it). When a copy exists, the plugin's dialog offers **Restore previous version (vX)**: the two directories are swapped by renaming (the current version is put back if the swap fails), the version just backed out of is added to **Ignored updates** so the next **Update** does not reinstall it straight away, and a restart is offered. Removing a plugin removes its copy too.
+
+Out of scope: the shared libraries themselves (`plugins/game-common/`, `plugins/sudoku-common/`) are not rolled back. A restored plugin does get back its own `common/` folder as it was, which is the copy it actually loads. Plugins installed from GitHub (**Discover plugins…**) are not backed up either.
+
+### Minimum KOReader version
+
+A plugin can declare `min_koreader = "2026.03"` in its `_meta.lua`; `update_manifest.py` copies it into the plugin list. Plugin Manager compares it with the running KOReader (`frontend/version.lua`): an incompatible plugin is flagged in the list and in its dialog, installing or updating it asks for confirmation (**Install anyway**), and **Update**, **Reinstall all** and **Import** skip it, naming it in their summary. A KOReader that does not know its own version (development builds) is treated as compatible.
 
 Files are fetched with a short pacing delay between requests, and a 429 (rate limit) from `raw.githubusercontent.com` is retried with backoff rather than failing the whole update — useful during a bulk Update/Reinstall run that touches every installed plugin.
 
@@ -89,6 +131,24 @@ This topic is self-tagged by repo owners and plenty of real plugins never set it
 - Only install repositories you trust: this downloads and runs arbitrary third-party code.
 
 GitHub's search API has a very low unauthenticated rate limit (10 requests/minute), and every non-`user:` search or "Load more" tap uses **two** of those requests (topic search + name search); the general API used for `user:NAME` browsing and for every install is more generous (60/hour) but still easy to exceed with many installs back to back. If you hit either, see **Configuration** below.
+
+## Export / import
+
+**Export installed list** writes `pluginmanager-export.json` to KOReader's data directory (the folder holding `plugins/` and `settings/`; on a Kobo, `.adds/koreader/`). It is plain JSON a person can read:
+
+```json
+{
+  "exported": "2026-10-30",
+  "format": "pluginmanager-export",
+  "format_version": 1,
+  "github": [ { "id": "myplugin", "repo": "someone/myplugin.koplugin" } ],
+  "plugins": [ { "id": "sudoku", "version": "2.5.0" } ]
+}
+```
+
+`plugins` lists the installed plugins this repository manages (never KOReader's own); `github` lists plugins installed with **Discover plugins…** or linked to a repository. It holds no settings or game progress.
+
+Copy the file to the same place on another reader, then **Import list…** there: Plugin Manager fetches the current plugin list, shows what it will install, and installs it with the same bulk path as **Update** — one summary, one restart offer. Plugins already installed are left as they are; imports install the repository's *current* version (older versions are not kept anywhere to pin to); plugins the repository no longer has are named and skipped; GitHub plugins are reinstalled from their repository last.
 
 ## Patches
 
@@ -135,10 +195,10 @@ Use a **classic** token (Settings → Developer settings → Personal access tok
 
 ## For developers: releasing an update
 
-1. Bump `version` in the plugin's `_meta.lua`.
-2. Update the matching `version` field in `manifest.json` at the repository root.
-3. If new source files were added to the plugin, add them to the `files` array in `manifest.json`.
-4. Commit and push to `master`. The plugin manager always fetches from the `master` branch.
+1. Bump `version` in the plugin's `_meta.lua` (and, if it needs a recent KOReader, add `min_koreader = "YYYY.MM"`).
+2. Commit and push the plugin's own repository.
+3. Regenerate `manifest.json` at the monorepo root with `python3 .github/scripts/update_manifest.py`: it rewrites the plugin's `version`, `files`, `sha256` (hashed from the plugin's committed files), `category` (from `.github/scripts/categories.json` — add new plugins there) and `min_koreader`. `--output PATH` writes the result elsewhere to check it first.
+4. Commit and push `manifest.json`. Until it is pushed, devices see the hashes of the previous commit; the drift rule above lets those installs through.
 
 ## Requirements
 

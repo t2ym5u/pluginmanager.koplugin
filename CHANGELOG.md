@@ -3,6 +3,74 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.5.0] - 2026-10-30
+
+### Added
+- Restart now: every change that needs a restart (install, update,
+  enable/disable, patches, restore) offers KOReader's own "Restart now /
+  Restart later" box (`UIManager:askForRestart`) instead of only saying so.
+  Bulk runs (Update, Reinstall all, Install all, Import) ask once, at the end.
+- The home screen's Update entry shows the number of updates waiting
+  ("Update (3)"), from the cached plugin list -- no network. The count, the
+  silent background check and the Update button now share one definition
+  (`pendingUpdates`), so they can no longer disagree.
+- Screenshot: the available- and installed-plugin dialogs show the plugin's
+  README screenshot from its `images/` (the installed copy when there is one,
+  otherwise downloaded once and cached).
+- What's new: before updating, shows only the CHANGELOG.md sections newer
+  than the installed version and up to the offered one (`[Unreleased]`
+  skipped; the whole file when its headings cannot be read), with an Update
+  button.
+- Categories: the plugin list is split into sections by the manifest's new
+  `category` field (labels translated), with a category filter in the search
+  dialog. Sort modes and the name filter work as before; uncategorised
+  plugins go under "Other"; a manifest without categories keeps the flat list.
+- Restore previous version: an update keeps the replaced version in
+  `plugins/.pluginmanager-backup/<plugin>/` (one per plugin), and the
+  installed-plugin dialog offers to swap it back (path-guarded renames,
+  restart offered, the backed-out version ignored). Shared libraries and
+  GitHub-installed plugins are not rolled back.
+- Integrity check: installs are staged in `plugins/.pluginmanager-staging/`
+  and committed only once every file is in. Every `.lua` must compile, and,
+  when the manifest carries `sha256`, every file must match it -- a
+  mismatch is re-downloaded once, then accepted only when the downloaded
+  `_meta.lua` is at least the manifest's version (upstream ahead of the
+  manifest), never when older. A failed install leaves the installed
+  version untouched instead of half-overwritten. Shared libraries are
+  downloaded and checked in full before the first file is written.
+- Minimum KOReader version: the manifest's optional `min_koreader` flags a
+  plugin in the list and its dialog, asks before installing it, and makes
+  Update / Reinstall all / Import skip it with a summary line.
+- Export / import: "Export installed list" writes
+  `pluginmanager-export.json` (installed repository plugins plus
+  GitHub-linked ones) to KOReader's data directory; "Import list…" shows what
+  it will install and installs it through the bulk path.
+- `pmlogic.lua`: the decision logic behind all of the above, free of KOReader
+  dependencies; specced by `test_pmlogic_spec.lua`, with the install paths
+  driven end to end by `test_install_integrity_spec.lua`.
+
+### Changed
+- The main menu and the Patches menu open full screen, like the plugin list
+  and every game, instead of as pop-ups. Lists opened from them come back to
+  them when closed, rather than dropping out to the book.
+- Installing a single plugin now always offers a restart, not only when Plugin
+  Manager updated itself: the plugin's code is not loaded until then.
+- `installPlugin`/`ensureCommon` resolve the manifest's `dir` through
+  `PathGuard.pluginPath` before using it, like removal already did.
+
+### Fixed
+- A Plugin Manager self-update deleted `pluginmanager_configuration.lua`, and
+  with it the user's GitHub token: the clean-up of files no longer listed in
+  the manifest removed it like a stale source file. Files a user creates in a
+  plugin's folder are now kept.
+
+### Requires
+- Regenerate `manifest.json` with the updated `update_manifest.py` before
+  releasing this version: its `files` list for pluginmanager must include the
+  new `pmlogic.lua`, or the self-update ships a `main.lua` that cannot load.
+  The `sha256`/`category`/`min_koreader` fields are optional: this version
+  works with a manifest that has none of them.
+
 ## [1.4.5] - 2026-10-07
 
 ### Fixed
