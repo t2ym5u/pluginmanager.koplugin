@@ -97,6 +97,9 @@ package.preload["ssl.https"] = function()
   return { request = function(req)
     H.fetched[#H.fetched + 1] = req.url
     local body = H.server[req.url]
+    -- A function serves a different body per request (e.g. a truncated
+    -- first download, then a good one).
+    if type(body) == "function" then body = body() end
     if not body then return nil, 404 end
     req.sink(body); req.sink(nil)
     return 1, 200, {}
