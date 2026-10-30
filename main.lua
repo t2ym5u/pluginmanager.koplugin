@@ -530,6 +530,29 @@ function PluginManager:searchGithubPlugins(opts)
     return items, nil, total_count, has_more
 end
 
+-- Every public repo `owner` owns whose raw API entry passes keep(repo), as
+-- Discover items. Shared by the plugin and patch `user:NAME` modes: the
+-- listing is the general API (60 requests/hour unauthenticated), one
+-- request per 100 repos, never one per repo.
+local function list_owner_repos(owner, keep)
+    local items, seen_any = {}, false
+    for page = 1, 5 do
+        local query = string.format("type=owner&per_page=100&page=%d", page)
+        local data, err = github_api_get("/users/" .. url_encode(owner) .. "/repos", query)
+        if not data then
+            if not seen_any then return nil, err end
+            break
+        end
+        if type(data) ~= "table" or #data == 0 then break end
+        seen_any = true
+        for _i, repo in ipairs(data) do
+            if keep(repo) then items[#items + 1] = repo_to_item(repo, owner) end
+        end
+        if #data < 100 then break end
+    end
+    return items
+end
+
 -- Lists every public repo owned by `owner` whose name looks like a plugin
 -- (".koplugin" suffix -- the convention this whole fleet, and most
 -- third-party authors, follow). This is deliberately independent of the
@@ -539,23 +562,16 @@ end
 -- doesn't depend on it. Paginates up to 500 repos (5 pages), which comfortably
 -- covers even a very prolific account.
 function PluginManager:listGithubOwnerPlugins(owner)
-    local items = {}
-    for page = 1, 5 do
-        local query = string.format("type=owner&per_page=100&page=%d", page)
-        local data, err = github_api_get("/users/" .. url_encode(owner) .. "/repos", query)
-        if not data then
-            if #items == 0 then return nil, err end
-            break
-        end
-        if type(data) ~= "table" or #data == 0 then break end
-        for _, repo in ipairs(data) do
-            if json_str(repo.name):match("%.koplugin$") then
-                items[#items + 1] = repo_to_item(repo, owner)
-            end
-        end
-        if #data < 100 then break end
-    end
-    return items
+    return list_owner_repos(owner, function(repo)
+        return json_str(repo.name):match("%.koplugin$") ~= nil
+    end)
+end
+
+-- Same, for "Discover patches…": the account's repositories that look like
+-- patch collections (PMLogic.isOwnerPatchRepo). Their files are listed when
+-- one is opened, exactly as for a search result.
+function PluginManager:listGithubOwnerPatchRepos(owner)
+    return list_owner_repos(owner, PMLogic.isOwnerPatchRepo)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1615,7 +1631,7 @@ end
 -- returns everything in one call), but are threaded through regardless to
 -- keep this a single entry point for both modes.
 function PluginManager:_showDiscoverDialog(page, accumulated, link_target)
-    local owner_query = self._discover_filter and self._discover_filter:match("^user:%s*(.+)$")
+    local owner_query = PMLogic.ownerQuery(self._discover_filter)
 
     local notice = InfoMessage:new{ text = _("Searching GitHub\u{2026}") }
     UIManager:show(notice)
@@ -2992,10 +3008,12 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
         end)
         if not ok then
             logger.warn("PluginManager: " .. lib_key .. " error:", err)
-            UIManager:show(InfoMessage:new{
-                text    = _("Shared library error:") .. "\n" .. (err or "?"),
-                timeout = 5,
-            })
+            local text = _("Shared library error:") .. "\n" .. (err or "?")
+            -- A caller with more to do after the plugins (Import's GitHub
+            -- installs, Install everything's patches) still gets to run it,
+            -- with this error at the top of its summary.
+            if opts.on_done then return opts.on_done({ text }, 0, false) end
+            UIManager:show(InfoMessage:new{ text = text, timeout = 5 })
             return
         end
     end
@@ -3133,6 +3151,33 @@ function PluginManager:_refreshDiscoverLinkedVersions(installed, on_done)
     step(1)
 end
 
+-- What Update does with `manifest`: the updates (the same list the home
+-- screen counts), plus every plugin not installed yet -- Update has always
+-- installed the whole catalogue. Anything needing a newer KOReader is
+-- skipped and named. Shared with Install everything, which runs exactly
+-- this before its patches.
+function PluginManager:_planFullUpdate(manifest)
+    local installed        = self:scanInstalled()
+    local updates, blocked = self:pendingUpdates(manifest, installed)
+    local candidates       = {}
+    for _i, p in ipairs(manifest.plugins) do
+        if not installed[p.id] then candidates[#candidates + 1] = p end
+    end
+    local new_ok, new_skipped = self:_splitCompatible(candidates)
+    local to_process = {}
+    for _i, p in ipairs(updates) do to_process[#to_process + 1] = p end
+    for _i, p in ipairs(new_ok)  do to_process[#to_process + 1] = p end
+    local _ok, skipped = self:_splitCompatible(blocked)
+    for _i, name in ipairs(new_skipped) do skipped[#skipped + 1] = name end
+    return {
+        installed  = installed,
+        to_process = to_process,
+        skipped    = skipped,
+        n_update   = #updates,
+        n_new      = #new_ok,
+    }
+end
+
 function PluginManager:_doFullUpdate()
     local notice = InfoMessage:new{ text = _("Fetching plugin list\u{2026}") }
     UIManager:show(notice)
@@ -3141,24 +3186,9 @@ function PluginManager:_doFullUpdate()
         local manifest = self:_fetchManifest()
         if not manifest then return end
 
-        -- Updates (the same list the home screen counts), plus every plugin
-        -- not installed yet -- Update has always installed the whole
-        -- catalogue. Anything needing a newer KOReader is skipped and named.
-        local installed        = self:scanInstalled()
-        local updates, blocked = self:pendingUpdates(manifest, installed)
-        local candidates       = {}
-        for _, p in ipairs(manifest.plugins) do
-            if not installed[p.id] then candidates[#candidates + 1] = p end
-        end
-        local new_ok, new_skipped = self:_splitCompatible(candidates)
-        local to_process = {}
-        for _, p in ipairs(updates) do to_process[#to_process + 1] = p end
-        for _, p in ipairs(new_ok)  do to_process[#to_process + 1] = p end
-        local _ok, skipped = self:_splitCompatible(blocked)
-        for _, name in ipairs(new_skipped) do skipped[#skipped + 1] = name end
-
-        self:_refreshDiscoverLinkedVersions(installed, function()
-            self:_runBulkInstall(manifest, to_process, { skipped = skipped })
+        local plan = self:_planFullUpdate(manifest)
+        self:_refreshDiscoverLinkedVersions(plan.installed, function()
+            self:_runBulkInstall(manifest, plan.to_process, { skipped = plan.skipped })
         end)
     end)
 end
@@ -3495,32 +3525,47 @@ function PluginManager:setPatchDisabled(name, disabled)
     end
 end
 
-function PluginManager:installAllPatches(items)
+-- Installs `items` one at a time, with progress, every one shielded by
+-- safe_call so a bad file cannot stop the rest; then on_done(succeeded,
+-- failed), failed being "name: error" lines. Shared by "Install all N
+-- patches" and Install everything.
+function PluginManager:_installPatchBatch(items, on_done)
     local total, failed = #items, {}
     local function step(i)
-        if i > total then
-            local parts = {}
-            if #failed > 0 then
-                parts[#parts + 1] = string.format(_("%d/%d installed. Failures:"), total - #failed, total)
-                for _, f in ipairs(failed) do parts[#parts + 1] = f end
-                if #failed < total then
-                    parts[#parts + 1] = _("Restart KOReader to apply.")
-                    self:askRestart(table.concat(parts, "\n"))
-                else
-                    UIManager:show(InfoMessage:new{ text = table.concat(parts, "\n"), timeout = 8 })
-                end
-            else
-                parts[#parts + 1] = string.format(_("%d patch(es) installed.\nRestart KOReader to apply."), total)
-                self:askRestart(table.concat(parts, "\n"))
-            end
-            return
-        end
+        if i > total then return on_done(total - #failed, failed) end
         local item = items[i]
-        local ok, err = safe_call(function() return self:installPatchFile(item) end)
-        if not ok then failed[#failed + 1] = item.name .. ": " .. (err or "?") end
-        UIManager:scheduleIn(0, function() step(i + 1) end)
+        local msg  = InfoMessage:new{
+            text = string.format(_("%d/%d  %s\u{2026}"), i, total, item.name),
+        }
+        UIManager:show(msg)
+        UIManager:scheduleIn(0.1, function()
+            UIManager:close(msg)
+            local ok, err = safe_call(function() return self:installPatchFile(item) end)
+            if not ok then failed[#failed + 1] = item.name .. ": " .. (err or "?") end
+            step(i + 1)
+        end)
     end
     step(1)
+end
+
+function PluginManager:installAllPatches(items)
+    local total = #items
+    self:_installPatchBatch(items, function(_succeeded, failed)
+        local parts = {}
+        if #failed > 0 then
+            parts[#parts + 1] = string.format(_("%d/%d installed. Failures:"), total - #failed, total)
+            for _, f in ipairs(failed) do parts[#parts + 1] = f end
+            if #failed < total then
+                parts[#parts + 1] = _("Restart KOReader to apply.")
+                self:askRestart(table.concat(parts, "\n"))
+            else
+                UIManager:show(InfoMessage:new{ text = table.concat(parts, "\n"), timeout = 8 })
+            end
+        else
+            parts[#parts + 1] = string.format(_("%d patch(es) installed.\nRestart KOReader to apply."), total)
+            self:askRestart(table.concat(parts, "\n"))
+        end
+    end)
 end
 
 function PluginManager:confirmInstallAllPatches(items)
@@ -3529,6 +3574,171 @@ function PluginManager:confirmInstallAllPatches(items)
         ok_text     = _("Install all"),
         ok_callback = function() self:installAllPatches(items) end,
     })
+end
+
+-- ---------------------------------------------------------------------------
+-- Install everything (home screen): Update, then the manifest's patches
+-- ---------------------------------------------------------------------------
+
+-- The git blob sha of `body` -- what GitHub's contents API reports as a
+-- file's `sha` -- so a patch already on the device can be compared with the
+-- repository's copy by content, whoever installed it. nil when KOReader's
+-- ffi/sha2 is missing; the sha recorded at install time is used instead.
+local _sha1
+local function git_blob_sha(body)
+    if _sha1 == nil then
+        local ok, sha2 = pcall(require, "ffi/sha2")
+        _sha1 = ok and type(sha2) == "table" and sha2.sha1 or false
+    end
+    if not _sha1 or not body then return nil end
+    local ok, h = pcall(_sha1, "blob " .. #body .. "\0" .. body)
+    return ok and h or nil
+end
+
+-- The patches on the device as PMLogic.planPatchInstalls wants them:
+-- filename -> {disabled, sha}.
+function PluginManager:patchStates()
+    local states = {}
+    for name, inst in pairs(self:scanInstalledPatches()) do
+        local link = self:getPatchInstall(name)
+        states[name] = {
+            disabled = inst.disabled,
+            sha      = git_blob_sha(read_file(_patches_dir .. "/" .. inst.file))
+                or (link and link.sha) or nil,
+        }
+    end
+    return states
+end
+
+-- Lists every patch file of every `patch_repos` repository of the manifest.
+-- One entry per repository, {repo, items} or {repo, err}: a repository that
+-- cannot be listed (rate limit, renamed, network) is reported, never fatal.
+function PluginManager:_listManifestPatches(manifest)
+    local results = {}
+    for _i, repo in ipairs(PMLogic.patchRepos(manifest)) do
+        local items, err = safe_call(function() return self:listRepoPatchFiles(repo) end)
+        if items then
+            results[#results + 1] = { full_name = repo.full_name, items = items }
+        else
+            results[#results + 1] = { full_name = repo.full_name, err = err or "?" }
+        end
+    end
+    return results
+end
+
+function PluginManager:doInstallEverything()
+    when_online(function() self:_doInstallEverything() end)
+end
+
+-- Fetches the plugin list, works out what Update would do and which
+-- patches the manifest's repositories would add or change, and confirms
+-- with those numbers before touching anything.
+function PluginManager:_doInstallEverything()
+    local notice = InfoMessage:new{ text = _("Fetching plugin list\u{2026}") }
+    UIManager:show(notice)
+    UIManager:scheduleIn(0.2, function()
+        UIManager:close(notice)
+        local manifest = self:_fetchManifest()
+        if not manifest then return end
+        local plan = self:_planFullUpdate(manifest)
+
+        local listing = InfoMessage:new{ text = _("Loading patches\u{2026}") }
+        UIManager:show(listing)
+        UIManager:scheduleIn(0.2, function()
+            UIManager:close(listing)
+            local repo_results = self:_listManifestPatches(manifest)
+            local all_items = {}
+            for _i, r in ipairs(repo_results) do
+                for _j, it in ipairs(r.items or {}) do all_items[#all_items + 1] = it end
+            end
+            local patch_plan = PMLogic.planPatchInstalls(all_items, self:patchStates())
+            local counts     = PMLogic.everythingCounts(plan.n_update, plan.n_new, repo_results, patch_plan)
+
+            local lines = {}
+            local function notes()
+                if #plan.skipped > 0 then
+                    lines[#lines + 1] = string.format(_("Skipped, needs a newer KOReader: %s"), table.concat(plan.skipped, ", "))
+                end
+                if counts.patches_disabled > 0 then
+                    local names = {}
+                    for _i, it in ipairs(patch_plan.disabled) do names[#names + 1] = it.name end
+                    lines[#lines + 1] = string.format(_("Left disabled: %s"), table.concat(names, ", "))
+                end
+                for _i, r in ipairs(repo_results) do
+                    if r.err then
+                        lines[#lines + 1] = string.format(_("Could not list patches from %s: %s"), r.full_name, r.err)
+                    end
+                end
+            end
+
+            -- Nothing to confirm, but the run still happens: like Update
+            -- with nothing outdated, it refreshes a shared library whose
+            -- version moved on its own, and its summary says all is current.
+            if counts.nothing_to_do then
+                return self:_runInstallEverything(manifest, plan, patch_plan, repo_results)
+            end
+
+            lines[#lines + 1] = _("Install everything?")
+            lines[#lines + 1] = string.format(_("Plugins: %d to install, %d to update."), counts.plugins_new, counts.plugins_update)
+            if counts.repos > 0 then
+                lines[#lines + 1] = string.format(_("Patches: %d to install from %d repositories."), counts.patches, counts.repos)
+            end
+            notes()
+            UIManager:show(ConfirmBox:new{
+                text        = table.concat(lines, "\n"),
+                ok_text     = _("Install"),
+                ok_callback = function()
+                    self:_runInstallEverything(manifest, plan, patch_plan, repo_results)
+                end,
+            })
+        end)
+    end)
+end
+
+-- Update's own bulk run, then the patches, then one summary and one
+-- restart prompt. The patch part runs whatever the plugin part did (even a
+-- shared-library error), and its own failures are added to the plugin
+-- results rather than replacing them.
+function PluginManager:_runInstallEverything(manifest, plan, patch_plan, repo_results)
+    self:_refreshDiscoverLinkedVersions(plan.installed, function()
+        self:_runBulkInstall(manifest, plan.to_process, {
+            skipped = plan.skipped,
+            on_done = function(parts, succeeded, has_self)
+                local function finish(p_succeeded, p_failed)
+                    if #repo_results > 0 then
+                        local total = #patch_plan.install
+                        if total == 0 then
+                            parts[#parts + 1] = _("All patches are up to date.")
+                        elseif #p_failed > 0 then
+                            parts[#parts + 1] = string.format(_("Patches: %d/%d installed. Failures:"), p_succeeded, total)
+                            for _i, f in ipairs(p_failed) do parts[#parts + 1] = f end
+                        else
+                            parts[#parts + 1] = string.format(_("%d patch(es) installed."), p_succeeded)
+                        end
+                    end
+                    if #patch_plan.disabled > 0 then
+                        local names = {}
+                        for _i, it in ipairs(patch_plan.disabled) do names[#names + 1] = it.name end
+                        parts[#parts + 1] = string.format(_("Left disabled: %s"), table.concat(names, ", "))
+                    end
+                    for _i, r in ipairs(repo_results) do
+                        if r.err then
+                            parts[#parts + 1] = string.format(_("Could not list patches from %s: %s"), r.full_name, r.err)
+                        end
+                    end
+                    self:_showSummary(parts, succeeded + p_succeeded > 0, has_self)
+                end
+                local ok, err = safe_call(function()
+                    self:_installPatchBatch(patch_plan.install, finish)
+                    return true
+                end)
+                if not ok then
+                    parts[#parts + 1] = _("Install failed:") .. " " .. (err or "?")
+                    self:_showSummary(parts, succeeded > 0, has_self)
+                end
+            end,
+        })
+    end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -3602,10 +3812,11 @@ end
 function PluginManager:showDiscoverPatchesFilterDialog()
     local input
     input = InputDialog:new{
-        title      = _("Search GitHub patches"),
-        input      = self._discover_patches_filter or "",
-        input_hint = _("Search text (optional)\u{2026}"),
-        buttons    = {{
+        title       = _("Search GitHub patches"),
+        description = _("Type user:NAME to browse every patch repository from one GitHub account."),
+        input       = self._discover_patches_filter or "",
+        input_hint  = _("Search text (optional)\u{2026}"),
+        buttons     = {{
             {
                 text     = _("Clear"),
                 callback = function()
@@ -3750,16 +3961,25 @@ function PluginManager:showDiscoverPatchesDialog()
     end
 end
 
+-- Same two modes as _showDiscoverDialog: a search (topic + name, paged), or
+-- `user:NAME`, one account's patch repositories in a single listing.
 function PluginManager:_showDiscoverPatchesDialog(page, accumulated)
+    local owner_query = PMLogic.ownerQuery(self._discover_patches_filter)
+
     local notice = InfoMessage:new{ text = _("Searching GitHub\u{2026}") }
     UIManager:show(notice)
     UIManager:scheduleIn(0.2, function()
         UIManager:close(notice)
-        local results, err, total_count, has_more = self:searchGithubPatchRepos{
-            text = self._discover_patches_filter,
-            sort = self:getDiscoverPatchesSort(),
-            page = page,
-        }
+        local results, err, total_count, has_more
+        if owner_query then
+            results, err = safe_call(function() return self:listGithubOwnerPatchRepos(owner_query) end)
+        else
+            results, err, total_count, has_more = self:searchGithubPatchRepos{
+                text = self._discover_patches_filter,
+                sort = self:getDiscoverPatchesSort(),
+                page = page,
+            }
+        end
         if not results then
             UIManager:show(InfoMessage:new{
                 text    = _("Search failed:") .. "\n" .. (err or "?"),
@@ -3770,7 +3990,12 @@ function PluginManager:_showDiscoverPatchesDialog(page, accumulated)
         for _, r in ipairs(results) do accumulated[#accumulated + 1] = r end
 
         if #accumulated == 0 then
-            if self._discover_patches_filter then
+            if owner_query then
+                UIManager:show(InfoMessage:new{
+                    text    = string.format(_("No patch repositories found for \u{201c}%s\u{201d}."), owner_query),
+                    timeout = 4,
+                })
+            elseif self._discover_patches_filter then
                 UIManager:show(ConfirmBox:new{
                     text        = string.format(
                         _("No results for \u{201c}%s\u{201d} (%d repositories are candidates in total, before that filter).\nClear the filter and search again?"),
@@ -3801,7 +4026,7 @@ function PluginManager:_showDiscoverPatchesDialog(page, accumulated)
                 callback  = function() self:showPatchRepoDialog(pref) end,
             }
         end
-        if has_more then
+        if not owner_query and has_more then
             items[#items + 1] = {
                 text     = _("Load more\u{2026}"),
                 callback = function() self:_showDiscoverPatchesDialog(page + 1, accumulated) end,
@@ -4070,6 +4295,7 @@ end
 function PluginManager:homeEntries()
     return {
         { text = self:updateEntryText(), callback = function() self:doFullUpdate() end },
+        { text = _("Install everything\u{2026}"), callback = function() self:doInstallEverything() end },
         {
             text     = _("Reinstall all\u{2026}"),
             callback = function()

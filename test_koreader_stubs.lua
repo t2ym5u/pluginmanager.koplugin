@@ -2,7 +2,7 @@
 -- against a real on-disk sandbox. Not a spec (the .busted pattern is
 -- "_spec%.lua$"), just the fixture test_bulk_install_spec.lua loads.
 local H = {}
-H.messages, H.queue, H.fetched = {}, {}, {}
+H.messages, H.queue, H.fetched, H.widgets = {}, {}, {}, {}
 H.server = {}            -- url -> body ; nil => 404
 
 local function sh(cmd)
@@ -37,6 +37,7 @@ local function widget(name)
     o = o or {}
     if o.text then H.messages[#H.messages + 1] = { w = name, text = o.text } end
     o._widget = name
+    H.widgets[#H.widgets + 1] = o   -- lets a spec press a ConfirmBox's OK
     return o
   end }
 end

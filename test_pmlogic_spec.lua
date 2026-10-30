@@ -264,3 +264,104 @@ describe("export / import", function()
         assert.are.equal('"a\\"b\\\\c\\n"', L.encodeJson('a"b\\c\n'))
     end)
 end)
+
+describe("Discover: user:NAME", function()
+  it("reads the account out of a user: search, nil otherwise", function()
+    assert.are.equal("t2ym5u", L.ownerQuery("user:t2ym5u"))
+    assert.are.equal("t2ym5u", L.ownerQuery("user: t2ym5u "))
+    assert.is_nil(L.ownerQuery("user:"))
+    assert.is_nil(L.ownerQuery("sudoku"))
+    assert.is_nil(L.ownerQuery("a user:t2ym5u"))
+    assert.is_nil(L.ownerQuery(nil))
+  end)
+
+  it("keeps an account's patch repositories, not its other KOReader repos", function()
+    local NULL = setmetatable({}, {})  -- rapidjson's null sentinel stand-in
+    local function repo(name, desc, topics)
+      return { name = name, description = desc, topics = topics or {} }
+    end
+    -- t2ym5u's real listing, abridged
+    assert.is_true(L.isOwnerPatchRepo(repo("koreader-user-patches",
+      "Runtime patches (koreader/patches drop-ins) for KOReader", { "koreader", "koreader-user-patch" })))
+    assert.is_false(L.isOwnerPatchRepo(repo("koreader",
+      "An ebook reader application supporting PDF, DjVu, EPUB, FB2 and many more formats")))
+    assert.is_false(L.isOwnerPatchRepo(repo("koreader-plugins", "KOReader game plugins — manifest index")))
+    assert.is_false(L.isOwnerPatchRepo(repo("game-common", "KOReader plugin: game-common")))
+    assert.is_false(L.isOwnerPatchRepo(repo("sudoku.koplugin", "patches the sudoku")))
+    assert.is_false(L.isOwnerPatchRepo(repo("buzz-it", NULL)))
+    -- other conventions in the wild
+    assert.is_true(L.isOwnerPatchRepo(repo("KOReader.patches", NULL)))
+    assert.is_true(L.isOwnerPatchRepo(repo("my-stuff", NULL, { "koreader-user-patch" })))
+    assert.is_true(L.isOwnerPatchRepo(repo("kobo-tweaks", "User patches for KOReader")))
+    assert.is_false(L.isOwnerPatchRepo(repo("kobo-tweaks", "Patches for my router")))
+    assert.is_false(L.isOwnerPatchRepo(nil))
+  end)
+end)
+
+describe("Install everything", function()
+  it("reads patch_repos, ignoring a missing field and anything malformed", function()
+    assert.are.same({}, L.patchRepos({ plugins = {} }))
+    assert.are.same({}, L.patchRepos({ patch_repos = "t2ym5u/x" }))
+    assert.are.same({}, L.patchRepos(nil))
+    local r = L.patchRepos({ patch_repos = {
+      "t2ym5u/koreader-user-patches", "T2YM5U/koreader-user-patches", "bad", "../x", "a/..",
+      "a/b/c", 42, "sebdelsol/KOReader.patches",
+    } })
+    assert.are.same({
+      { owner = "t2ym5u", name = "koreader-user-patches", full_name = "t2ym5u/koreader-user-patches" },
+      { owner = "sebdelsol", name = "KOReader.patches", full_name = "sebdelsol/KOReader.patches" },
+    }, r)
+  end)
+
+  it("installs new and changed patches, leaves current and disabled ones alone", function()
+    local items = {
+      { name = "2-new.lua",      sha = "a" },
+      { name = "2-same.lua",     sha = "b" },
+      { name = "2-changed.lua",  sha = "c" },
+      { name = "2-off.lua",      sha = "d" },
+      { name = "2-unknown.lua",  sha = "e" },
+      { name = "2-new.lua",      sha = "z" },   -- same file from a second repo
+    }
+    local plan = L.planPatchInstalls(items, {
+      ["2-same.lua"]    = { sha = "b" },
+      ["2-changed.lua"] = { sha = "old" },
+      ["2-off.lua"]     = { sha = "old", disabled = true },
+      ["2-unknown.lua"] = {},
+    })
+    local function names(list) local t = {} for _, it in ipairs(list) do t[#t + 1] = it.name end return t end
+    assert.are.same({ "2-new.lua", "2-changed.lua", "2-unknown.lua" }, names(plan.install))
+    assert.are.same({ "2-same.lua" }, names(plan.current))
+    assert.are.same({ "2-off.lua" }, names(plan.disabled))
+    assert.are.equal("z", plan.duplicate[1].sha)
+  end)
+
+  it("a disabled patch already at the repository's version counts as current", function()
+    local plan = L.planPatchInstalls({ { name = "2-off.lua", sha = "d" } },
+      { ["2-off.lua"] = { sha = "d", disabled = true } })
+    assert.are.equal(1, #plan.current)
+    assert.are.equal(0, #plan.disabled)
+  end)
+
+  it("counts what the confirmation announces", function()
+    local plan = { install = { 1, 2 }, current = { 3 }, disabled = { 4 } }
+    local c = L.everythingCounts(3, 5, {
+      { full_name = "a/b", items = { 1, 2, 3, 4 } },
+      { full_name = "c/d", err = "HTTP 404" },
+    }, plan)
+    assert.are.equal(8, c.plugins)
+    assert.are.equal(3, c.plugins_update)
+    assert.are.equal(5, c.plugins_new)
+    assert.are.equal(2, c.patches)
+    assert.are.equal(1, c.patches_current)
+    assert.are.equal(1, c.patches_disabled)
+    assert.are.equal(2, c.repos)
+    assert.are.equal(1, c.repos_failed)
+    assert.is_false(c.nothing_to_do)
+  end)
+
+  it("nothing to do without a plugin or a patch to install, even with no patch_repos", function()
+    local c = L.everythingCounts(0, 0, {}, L.planPatchInstalls({}, {}))
+    assert.is_true(c.nothing_to_do)
+    assert.are.equal(0, c.repos)
+  end)
+end)
