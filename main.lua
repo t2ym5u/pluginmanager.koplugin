@@ -282,7 +282,41 @@ local function sleep(seconds)
     if ok and socket.sleep then socket.sleep(seconds) end
 end
 
-local function fetch_url(url)
+-- Explicit timeouts, so a dead connection (Wi-Fi gone, the reader's radio
+-- asleep, a stalled CDN edge) fails in seconds instead of hanging the run:
+-- LuaSocket's own default is 60 s per blocking operation with no overall
+-- limit, and a bulk run makes over a hundred requests. KOReader's socketutil
+-- is the supported way (it patches socket.tcp, which LuaSec uses too, and
+-- provides sinks that enforce the total once data flows); where it cannot
+-- be loaded (headless specs) requests simply run with the library defaults.
+local TIMEOUT_CONNECT    = 15   -- seconds without progress on the socket
+local TIMEOUT_FILE_TOTAL = 20   -- one small file
+local TIMEOUT_ZIP_TOTAL  = 60   -- one plugin zip (a few hundred KB) ...
+local ZIP_MIN_RATE       = 32 * 1024  -- ... plus 1 s per 32 KB (fifteen's is 2 MB)
+local TIMEOUT_LARGE      = 60   -- manifest.json
+
+local function get_socketutil()
+    local ok, su = pcall(require, "socketutil")
+    if ok and type(su) == "table" and su.set_timeout and su.reset_timeout then return su end
+    return nil
+end
+
+-- Runs https.request(req) with the given timeouts (total < 0: none) and
+-- always restores KOReader's defaults afterwards, even if the request
+-- raises. `make_sink(su)` builds the sink, so it can be socketutil's
+-- timeout-aware one. Returns https.request's own (result, status, headers).
+local function timed_request(https, req, total, make_sink)
+    local su = get_socketutil()
+    if su then su:set_timeout(TIMEOUT_CONNECT, total) end
+    req.sink = make_sink(su)
+    local ok, result, status, headers = pcall(https.request, req)
+    if su then su:reset_timeout() end
+    if not ok then return nil, tostring(result) end
+    return result, status, headers
+end
+
+-- `total_timeout` (seconds) defaults to one small file's.
+local function fetch_url(url, total_timeout)
     local ok1, https = pcall(require, "ssl.https")
     if not ok1 then return nil, _("ssl.https not available") end
     local ok2, ltn12 = pcall(require, "ltn12")
@@ -292,12 +326,13 @@ local function fetch_url(url)
     for attempt = 1, FETCH_MAX_RETRIES do
         sleep(FETCH_PACE_DELAY)
         local chunks = {}
-        local result, status, headers = https.request{
+        local result, status, headers = timed_request(https, {
             url      = url,
-            sink     = ltn12.sink.table(chunks),
             verify   = "none",
             protocol = "tlsv1_2",
-        }
+        }, total_timeout or TIMEOUT_FILE_TOTAL, function(su)
+            return su and su.table_sink and su.table_sink(chunks) or ltn12.sink.table(chunks)
+        end)
         if result and status == 200 then
             return table.concat(chunks)
         end
@@ -316,9 +351,10 @@ end
 -- string in memory -- used for zip downloads, which can run to a few
 -- hundred KB and would otherwise sit fully in RAM twice (once as the ltn12
 -- chunk table, once as table.concat's result) on memory-constrained e-ink
--- hardware. ltn12.sink.file closes the handle itself once done, on both
--- success and failure.
-local function fetch_to_file(url, path, extra_headers)
+-- hardware. The file sink closes the handle itself once done, on both
+-- success and failure. `total_timeout` nil: no overall limit (a Discover
+-- zipball can be large), only the per-operation one.
+local function fetch_to_file(url, path, extra_headers, total_timeout)
     local ok1, https = pcall(require, "ssl.https")
     if not ok1 then return false, _("ssl.https not available") end
     local ok2, ltn12 = pcall(require, "ltn12")
@@ -329,16 +365,18 @@ local function fetch_to_file(url, path, extra_headers)
     local headers = { ["User-Agent"] = "pluginmanager.koplugin" }
     for k, v in pairs(extra_headers or {}) do headers[k] = v end
 
-    local result, status = https.request{
+    local result, status = timed_request(https, {
         url      = url,
-        sink     = ltn12.sink.file(file),
         headers  = headers,
         verify   = "none",
         protocol = "tlsv1_2",
-    }
+    }, total_timeout or -1, function(su)
+        return su and su.file_sink and su.file_sink(file) or ltn12.sink.file(file)
+    end)
     if result and status == 200 then return true end
+    pcall(file.close, file)  -- already closed by the sink in most cases
     os.remove(path)
-    return false, string.format(_("HTTP %s"), tostring(status or "?"))
+    return false, string.format(_("HTTP %s"), tostring(status or "?")), status
 end
 
 -- ---------------------------------------------------------------------------
@@ -771,7 +809,7 @@ function PluginManager:_silentCheck()
     local ok, NetworkMgr = pcall(require, "ui/network/manager")
     if ok and NetworkMgr and not NetworkMgr:isConnected() then return end
 
-    local body = fetch_url(MANIFEST_URL)
+    local body = fetch_url(MANIFEST_URL, TIMEOUT_LARGE)
     if not body then return end
     local manifest = parse_json(body)
     if not manifest or not manifest.plugins then return end
@@ -916,6 +954,308 @@ local function fetch_checked(url, fname, expected)
     return body, verdict, compiles
 end
 
+-- ---------------------------------------------------------------------------
+-- Cooperative yielding: keeps the UI alive during a bulk run
+-- ---------------------------------------------------------------------------
+
+-- A bulk run installs each plugin inside a coroutine of its own (run_async).
+-- ui_yield() hands control back to UIManager for one turn of its loop --
+-- the progress dialog repaints, a tap on Stop is processed -- and the
+-- install resumes on the next tick. Outside that coroutine (a single
+-- install, the specs calling installPlugin directly, any coroutine someone
+-- else owns) it does nothing, so the install code stays plain sequential
+-- code either way.
+local _run_co = nil
+
+local function ui_yield()
+    if _run_co ~= nil and coroutine.running() == _run_co then
+        coroutine.yield()
+    end
+end
+
+-- Runs fn() in a coroutine, resuming it from UIManager after every
+-- ui_yield(), then calls on_done(fn's two results) -- or on_done(false,
+-- message) when fn raised, like safe_call.
+local function run_async(fn, on_done)
+    local co = coroutine.create(fn)
+    local function resume()
+        local prev = _run_co
+        _run_co = co
+        local ok, a, b = coroutine.resume(co)
+        _run_co = prev
+        if not ok then
+            logger.warn("PluginManager:", a)
+            return on_done(false, tostring(a))
+        end
+        if coroutine.status(co) == "dead" then return on_done(a, b) end
+        UIManager:scheduleIn(0, resume)
+    end
+    resume()
+end
+
+-- ---------------------------------------------------------------------------
+-- Keeping the reader awake during a bulk run
+-- ---------------------------------------------------------------------------
+
+-- A full run can take many minutes on a slow reader, with no input from the
+-- user. KOReader's autosuspend plugin suspends a Kobo after 15 minutes of
+-- that by default, Wi-Fi drops with it, and the run dies mid-way. Two
+-- supported switches hold it off, both what KOReader's own background jobs
+-- use: PluginShare.pause_auto_suspend (read by autosuspend each time its
+-- timer fires; keepalive.koplugin uses the same flag) and
+-- UIManager:preventStandby() (paired allowStandby(), counted). Nested runs
+-- (Import = bulk install + GitHub installs) share one hold through a count.
+-- Each piece is a no-op where it does not exist (emulator, older builds).
+local _awake_holds   = 0
+local _awake_saved   = nil   -- pause_auto_suspend as it was before the first hold
+local _awake_standby = false
+
+local function get_pluginshare()
+    local ok, PluginShare = pcall(require, "pluginshare")
+    return ok and type(PluginShare) == "table" and PluginShare or nil
+end
+
+local function hold_awake()
+    _awake_holds = _awake_holds + 1
+    if _awake_holds > 1 then return end
+    local share = get_pluginshare()
+    if share then
+        _awake_saved = share.pause_auto_suspend
+        share.pause_auto_suspend = true
+    end
+    _awake_standby = false
+    if type(UIManager.preventStandby) == "function" and type(UIManager.allowStandby) == "function" then
+        _awake_standby = pcall(UIManager.preventStandby, UIManager)
+    end
+end
+
+-- Returns a release function that is safe to call more than once: every
+-- exit path of a run calls it, and only the first call counts.
+local function awake_guard()
+    hold_awake()
+    local released = false
+    return function()
+        if released then return end
+        released = true
+        if _awake_holds <= 0 then return end
+        _awake_holds = _awake_holds - 1
+        if _awake_holds > 0 then return end
+        local share = get_pluginshare()
+        if share then share.pause_auto_suspend = _awake_saved end
+        _awake_saved = nil
+        if _awake_standby then pcall(UIManager.allowStandby, UIManager) end
+        _awake_standby = false
+        -- The end of a run counts as activity: the suspend countdown starts
+        -- from now, so the summary does not vanish into an instant sleep.
+        if type(UIManager.event_hook) == "table" and UIManager.event_hook.execute then
+            pcall(UIManager.event_hook.execute, UIManager.event_hook, "InputEvent")
+        end
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- One zip per plugin
+-- ---------------------------------------------------------------------------
+
+-- The monorepo commits a ready zip of every plugin (dist/<id>.zip, built by
+-- scripts/build_release.sh: <dir>/ with its common/, plus game-common/ or
+-- sudoku-common/ beside it), and manifest.json names it with its sha256 and
+-- size. One download per plugin instead of one per file -- about ten times
+-- fewer HTTPS requests over a whole Update -- which is what makes a full run
+-- bearable on a slow reader. Any problem with it (no sha2 to check it with,
+-- HTTP error, wrong size or hash -- e.g. the CDN still serving the previous
+-- release's zip for a few minutes --, a corrupt archive, a missing or
+-- unsafe entry) falls back to the per-file download for that plugin.
+local ZIP_BASE_URL = MANIFEST_URL:match("^(.*/)")
+local ZIP_DIR      = DataStorage:getDataDir() .. "/cache/pluginmanager"
+
+-- The manifest's `zip` field, validated, or nil.
+local function zip_spec(info)
+    local z = type(info) == "table" and info.zip
+    if type(z) ~= "table" then return nil end
+    if type(z.path) ~= "string" or not z.path:match("^dist/[%w][%w%._-]*%.zip$") or z.path:find("..", 1, true) then
+        return nil
+    end
+    if type(z.sha256) ~= "string" or not z.sha256:match("^%x+$") then return nil end
+    local size = tonumber(z.size)
+    if not size or size <= 0 then return nil end
+    return { url = ZIP_BASE_URL .. z.path, sha256 = z.sha256:lower(), size = size }
+end
+
+local function file_size(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local n = f:seek("end")
+    f:close()
+    return n
+end
+
+-- SHA-256 of a file, fed in 64 KB chunks where ffi/sha2 supports it
+-- (sha256() with no argument returns an incremental hasher), else from the
+-- whole file at once. nil when no sha2 is available.
+local function file_sha256(path)
+    if sha256("") == nil then return nil end
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local ok_inc, append = pcall(_sha256)
+    if ok_inc and type(append) == "function" then
+        local ok, h = pcall(function()
+            while true do
+                local chunk = f:read(65536)
+                if not chunk then break end
+                append(chunk)
+            end
+            return append()
+        end)
+        f:close()
+        return ok and h or nil
+    end
+    local body = f:read("*a")
+    f:close()
+    return sha256(body)
+end
+
+-- Downloads `info`'s zip to a cache file and checks its size and hash.
+-- Returns the file's path, or (nil, message). Paced and retried on 429 like
+-- fetch_url.
+local function download_zip(info)
+    local z = zip_spec(info)
+    if not z then return nil, "no zip in the manifest" end
+    if sha256("") == nil then return nil, "sha256 not available" end
+    mkdir_p(ZIP_DIR)
+    local path = string.format("%s/%s.zip", ZIP_DIR, tostring(info.id or info.dir):gsub("[^%w%._-]", "_"))
+    local delay = FETCH_RETRY_DELAY
+    for attempt = 1, FETCH_MAX_RETRIES do
+        sleep(FETCH_PACE_DELAY)
+        local ok, err, status = fetch_to_file(z.url, path, nil, TIMEOUT_ZIP_TOTAL + math.ceil(z.size / ZIP_MIN_RATE))
+        if ok then break end
+        if status == 429 and attempt < FETCH_MAX_RETRIES then
+            sleep(delay)
+            delay = delay * 2
+        else
+            return nil, err
+        end
+    end
+    local size = file_size(path)
+    if size ~= z.size then
+        os.remove(path)
+        return nil, string.format("zip size %s, expected %d", tostring(size), z.size)
+    end
+    if file_sha256(path) ~= z.sha256 then
+        os.remove(path)
+        return nil, "zip sha256 mismatch"
+    end
+    return path
+end
+
+local function open_zip(path)
+    local ok, Archiver = pcall(require, "ffi/archiver")
+    if not ok or type(Archiver) ~= "table" or not Archiver.Reader then
+        return nil, _("Archive support not available.")
+    end
+    local reader = Archiver.Reader:new()
+    local ok_open, opened = pcall(reader.open, reader, path)
+    if not ok_open or not opened then
+        return nil, _("Failed to open downloaded archive.")
+    end
+    return reader
+end
+
+-- Extracts, from the open zip, every entry `prefix .. rel` with `wanted[rel]`
+-- into dest_root/rel, in one pass in archive order (ffi/archiver reads
+-- sequentially; seeking backwards re-opens the file). The whole archive is
+-- refused at the first entry name PathGuard rejects -- anywhere in it, not
+-- only under `prefix`: a zip carrying a "../" entry is not one
+-- build_release.sh made. Every wanted entry must be found.
+local function extract_from_zip(reader, prefix, wanted, dest_root)
+    local found, n = {}, 0
+    for entry in reader:iterate() do
+        local name  = entry.path or ""
+        local check = name:gsub("/+$", "")
+        if check == "" or not PathGuard.filePath(dest_root, check) then
+            return false, string.format(_("Refused archive entry: %s"), name)
+        end
+        if entry.mode == "file" and name:sub(1, #prefix) == prefix then
+            local rel = name:sub(#prefix + 1)
+            if wanted[rel] and not found[rel] then
+                local dest = PathGuard.filePath(dest_root, rel)
+                if not dest then
+                    return false, string.format(_("Refused archive entry: %s"), name)
+                end
+                local subdir = dest:match("^(.*)/[^/]+$")
+                if subdir then mkdir_p(subdir) end
+                if not reader:extractToPath(name, dest) then
+                    return false, string.format(_("Failed to extract %s"), rel)
+                end
+                found[rel] = true
+                n = n + 1
+                if n % 8 == 0 then ui_yield() end
+            end
+        end
+    end
+    if reader.err then return false, tostring(reader.err) end
+    for rel in pairs(wanted) do
+        if not found[rel] then return false, "missing from zip: " .. rel end
+    end
+    return true
+end
+
+-- The compile check of the per-file path, on extracted files: every .lua
+-- in `files` under `root` must compile. Returns true or (false, message).
+local function check_compiles(root, files)
+    for _i, fname in ipairs(files) do
+        if PMLogic.isLuaFile(fname) then
+            local f = io.open(root .. "/" .. fname, "rb")
+            local body = f and f:read("*a")
+            if f then f:close() end
+            if not body or not PMLogic.compiles(body, fname) then
+                return false, string.format(_("%s does not compile (incomplete download?)"), fname)
+            end
+        end
+    end
+    return true
+end
+
+-- Downloads `info`'s zip and extracts `entries` (a list of paths relative
+-- to `prefix` inside the zip) into `stage`, which is emptied first. On
+-- failure `stage` is removed again. Returns true or (false, message).
+local function stage_from_zip(info, prefix, entries, stage)
+    local zip_path, err = download_zip(info)
+    if not zip_path then return false, err end
+    ui_yield()
+    local reader, oerr = open_zip(zip_path)
+    if not reader then
+        os.remove(zip_path)
+        return false, oerr
+    end
+    local wanted = {}
+    for _i, rel in ipairs(entries) do wanted[rel] = true end
+    rm_rf(stage)
+    mkdir_p(stage)
+    local ok, xerr = safe_call(extract_from_zip, reader, prefix, wanted, stage)
+    pcall(reader.close, reader)
+    os.remove(zip_path)
+    if ok then ok, xerr = check_compiles(stage, entries) end
+    if not ok then
+        rm_rf(stage)
+        return false, xerr
+    end
+    return true
+end
+
+-- A plugin whose zip can refresh shared library `lib_key`: one that uses it
+-- and ships a zip, preferring the smallest download.
+local function lib_carrier(manifest, lib_key)
+    local best, best_size
+    for _i, p in ipairs(manifest.plugins or {}) do
+        local z = p.common_lib == lib_key and zip_spec(p)
+        if z and (not best_size or z.size < best_size) then
+            best, best_size = p, z.size
+        end
+    end
+    return best
+end
+
 -- `lib_key` is a manifest.json top-level key naming a downloadable common/
 -- bundle -- "common" (game-common, ScreenBase-based games) or
 -- "sudoku_common" (sudoku-common, BaseScreen-based sudoku variants); see the
@@ -954,6 +1294,37 @@ function PluginManager:ensureCommon(manifest, lib_key, force)
             if not is_newer(v or "0", spec.version) then return true end
         end
     end
+    -- Zip first: the library sits at the top level of every consuming
+    -- plugin's zip (as <spec.dir>/), so one download refreshes all of it.
+    -- Staged and compile-checked before the first file is written, like the
+    -- per-file path below, which remains the fallback.
+    local carrier = lib_carrier(manifest, lib_key)
+    local stage   = carrier and type(spec.files) == "table" and staging_path(spec.dir)
+    if stage then
+        local all_safe = true
+        for _i, fname in ipairs(spec.files) do
+            if not PathGuard.filePath(lib_dir, fname) or not PathGuard.filePath(stage, fname) then all_safe = false end
+        end
+        local ok, zerr = false, "refused file entry"
+        if all_safe then ok, zerr = stage_from_zip(carrier, spec.dir .. "/", spec.files, stage) end
+        if ok then
+            mkdir_p(lib_dir)
+            for _i, fname in ipairs(spec.files) do
+                local src, dest = PathGuard.filePath(stage, fname), PathGuard.filePath(lib_dir, fname)
+                local subdir = dest:match("^(.*)/[^/]+$")
+                if subdir then mkdir_p(subdir) end
+                if not os.rename(src, dest) and not copy_file(src, dest) then
+                    rm_rf(stage)
+                    return false, string.format("%s: %s", dest, "rename")
+                end
+            end
+            rm_rf(stage)
+            write_file(lib_dir .. "/.version", spec.version)
+            return true
+        end
+        logger.info("PluginManager:", lib_key, "zip refresh failed, downloading file by file:", zerr)
+    end
+
     local base    = spec.raw_base_url or ((manifest.raw_base_url or "") .. spec.dir .. "/")
     local fetched = {}
     for _i, fname in ipairs(spec.files) do
@@ -977,6 +1348,7 @@ function PluginManager:ensureCommon(manifest, lib_key, force)
             logger.info("PluginManager: accepted hash drift for", spec.dir .. "/" .. fname)
         end
         fetched[#fetched + 1] = { dest = dest, body = body }
+        ui_yield()
     end
     mkdir_p(lib_dir)
     for _i, f in ipairs(fetched) do
@@ -1058,7 +1430,9 @@ end
 
 -- Installs or updates one plugin, in three steps:
 --
--- 1. Every file is downloaded into the staging folder and checked. Nothing
+-- 1. Every file is downloaded into the staging folder and checked -- taken
+--    from the plugin's zip when the manifest names one, else (or when the
+--    zip is unusable) downloaded one by one. Nothing
 --    under the plugin's own directory is touched yet, so any failure leaves
 --    the installed version exactly as it was. (The old code wrote each file
 --    over the live plugin as it arrived; a download failing half way left a
@@ -1090,47 +1464,74 @@ function PluginManager:installPlugin(plugin_info, manifest)
         return false, msg
     end
 
-    -- 1. Download into staging.
-    rm_rf(stage)
-    mkdir_p(stage)
-    local drifted, meta_body = {}, nil
+    -- Every entry is checked against both trees before anything is
+    -- downloaded: it names where the file will finally land, not just where
+    -- it is staged.
     for _i, fname in ipairs(plugin_info.files) do
-        -- Checked against both trees: the entry names where it will finally
-        -- land, not just where it is staged.
-        local staged = PathGuard.filePath(stage, fname)
-        if not staged or not PathGuard.filePath(plugin_dir, fname) then
+        if not PathGuard.filePath(stage, fname) or not PathGuard.filePath(plugin_dir, fname) then
             return fail(string.format(_("Refused file entry: %s"), tostring(fname)))
-        end
-        local body, verdict, compiles = fetch_checked(base .. fname, fname, expected_hash(hashes, fname))
-        if not body then
-            return fail(string.format(_("Download failed: %s \u{2014} %s"), fname, verdict))
-        end
-        -- 2a. Compile check.
-        if not compiles then
-            return fail(string.format(_("%s does not compile (incomplete download?)"), fname))
-        end
-        if verdict == "mismatch" then drifted[#drifted + 1] = fname end
-        if fname == "_meta.lua" then meta_body = body end
-        local subdir = staged:match("^(.*)/[^/]+$")
-        if subdir then mkdir_p(subdir) end
-        local ok, werr = write_file(staged, body)
-        if not ok then
-            return fail(string.format(_("Write failed: %s \u{2014} %s"), fname, werr))
         end
     end
 
-    -- 2b. Hash drift.
-    if #drifted > 0 then
-        local meta_version = meta_body and parse_meta(meta_body).version
-        if not PMLogic.driftAcceptable(meta_version, plugin_info.version) then
-            return fail(string.format(
-                _("%s failed its integrity check (%s)."),
-                plugin_info.fullname or plugin_info.id, table.concat(drifted, ", ")
-            ))
+    -- 1. Into staging: from the plugin's zip when the manifest names one
+    --    (one download, verified by its sha256 as a whole; see "One zip per
+    --    plugin" above), else -- or when anything about the zip is wrong --
+    --    file by file.
+    local staged_from_zip = false
+    if zip_spec(plugin_info) then
+        local ok, zerr = stage_from_zip(plugin_info, plugin_info.dir .. "/", plugin_info.files, stage)
+        if ok then
+            local meta = read_meta(stage .. "/_meta.lua")
+            if PMLogic.driftAcceptable(meta and meta.version, plugin_info.version) then
+                staged_from_zip = true
+            else
+                zerr = "zip holds an older version"
+            end
         end
-        logger.info("PluginManager:", plugin_info.id, "accepted hash drift, upstream is ahead of the manifest:",
-            table.concat(drifted, ", "))
+        if not staged_from_zip then
+            logger.info("PluginManager:", plugin_info.id, "zip install failed, downloading file by file:", zerr)
+        end
     end
+
+    if not staged_from_zip then
+        rm_rf(stage)
+        mkdir_p(stage)
+        local drifted, meta_body = {}, nil
+        for _i, fname in ipairs(plugin_info.files) do
+            local staged = PathGuard.filePath(stage, fname)
+            local body, verdict, compiles = fetch_checked(base .. fname, fname, expected_hash(hashes, fname))
+            if not body then
+                return fail(string.format(_("Download failed: %s \u{2014} %s"), fname, verdict))
+            end
+            -- 2a. Compile check.
+            if not compiles then
+                return fail(string.format(_("%s does not compile (incomplete download?)"), fname))
+            end
+            if verdict == "mismatch" then drifted[#drifted + 1] = fname end
+            if fname == "_meta.lua" then meta_body = body end
+            local subdir = staged:match("^(.*)/[^/]+$")
+            if subdir then mkdir_p(subdir) end
+            local ok, werr = write_file(staged, body)
+            if not ok then
+                return fail(string.format(_("Write failed: %s \u{2014} %s"), fname, werr))
+            end
+            body = nil
+            ui_yield()
+        end
+
+        -- 2b. Hash drift.
+        if #drifted > 0 then
+            local meta_version = meta_body and parse_meta(meta_body).version
+            if not PMLogic.driftAcceptable(meta_version, plugin_info.version) then
+                return fail(string.format(
+                    _("%s failed its integrity check (%s)."),
+                    plugin_info.fullname or plugin_info.id, table.concat(drifted, ", ")
+                ))
+            end
+            logger.info("PluginManager:", plugin_info.id, "accepted hash drift, upstream is ahead of the manifest:",
+                table.concat(drifted, ", "))
+        end
+    end -- per-file staging
 
     -- 3. Keep the replaced version, then commit.
     self:backupPlugin(plugin_info, plugin_dir)
@@ -1445,10 +1846,12 @@ end
 -- receives the summary lines instead (Import chains this after its own
 -- batch and asks once for both).
 function PluginManager:installAllFromGithub(repos, on_done)
+    local release = awake_guard()
     local total  = #repos
     local failed = {}
     local function step(i)
         if i > total then
+            release()
             local parts = {}
             if #failed > 0 then
                 parts[#parts + 1] = string.format(_("%d/%d installed. Failures:"), total - #failed, total)
@@ -2916,7 +3319,7 @@ end
 -- the network-error dialog itself and returns nil -- callers can just bail
 -- out when manifest is nil.
 function PluginManager:_fetchManifest()
-    local body, err = fetch_url(MANIFEST_URL)
+    local body, err = fetch_url(MANIFEST_URL, TIMEOUT_LARGE)
     if not body then
         UIManager:show(InfoMessage:new{
             text    = _("Network error:") .. "\n" .. (err or "?"),
@@ -2975,16 +3378,85 @@ function PluginManager:_splitCompatible(plugins)
     return ok, skipped
 end
 
--- Shared by doFullUpdate, doFullReinstall and Import: refreshes every shared
--- library referenced by `to_process` (or already installed), then installs
--- each plugin in `to_process` one at a time with progress feedback.
+-- One dialog for a whole bulk run: a heading ("Updating 110 plugin(s)…"),
+-- the current item ("12/110 · Boggle") and a Stop button. Updated in place
+-- with a "ui" refresh of its own area, instead of the old close-one-
+-- InfoMessage-show-the-next per plugin. Stop is honoured between items: the
+-- run finishes the one in progress, then ends with its summary. Neither Back
+-- nor a tap beside the dialog closes it -- the run would carry on unseen.
+-- Returns an object with update(line), stopped(), close() and a writable
+-- `heading`.
+function PluginManager:_openProgress(heading)
+    local prog = { heading = heading, stop_requested = false, closed = false }
+    local function text()
+        local t = { prog.heading }
+        if prog.line then t[#t + 1] = prog.line end
+        if prog.note then t[#t + 1] = prog.note end
+        return table.concat(t, "\n")
+    end
+    function prog.refresh()
+        if prog.closed then return end
+        local d = prog.dialog
+        d.title = text()
+        if type(d.reinit) ~= "function" then return end
+        pcall(function()
+            local old = d.movable and d.movable.dimen
+            if old and old.copy then old = old:copy() end
+            d:reinit()
+            UIManager:setDirty("all", function()
+                local new = d.movable and d.movable.dimen
+                if old and new and old.combine then return "ui", old:combine(new) end
+                return "ui", new or old
+            end)
+        end)
+    end
+    function prog.update(_self, line)
+        prog.line = line
+        prog.refresh()
+    end
+    function prog.stopped() return prog.stop_requested end
+    function prog.close()
+        if prog.closed then return end
+        prog.closed = true
+        UIManager:close(prog.dialog)
+    end
+    local dialog = ButtonDialog:new{
+        title       = text(),
+        title_align = "center",
+        buttons     = { {
+            {
+                text     = _("Stop"),
+                callback = function()
+                    if prog.stop_requested then return end
+                    prog.stop_requested = true
+                    prog.note = _("Stopping after the current one\u{2026}")
+                    prog.refresh()
+                end,
+            },
+        } },
+    }
+    dialog.onClose    = function() return true end
+    dialog.onTapClose = function() return true end
+    prog.dialog = dialog
+    UIManager:show(dialog)
+    return prog
+end
+
+-- Shared by doFullUpdate, doFullReinstall, Install everything and Import:
+-- refreshes every shared library referenced by `to_process` (or already
+-- installed), then installs each plugin in `to_process` one at a time, under
+-- one progress dialog (see _openProgress) and with the reader kept awake
+-- (see awake_guard) until the very end, whichever way the run ends.
 -- `opts` lets callers customise the three user-facing strings without
 -- duplicating this whole flow: nothing_to_do_text, done_text (takes one
 -- %d, the count), progress_text (same). `opts.force_common` re-fetches the
 -- shared libraries even when their .version stamp is already current.
 -- `opts.skipped` lists plugins left out for needing a newer KOReader, for
--- the summary. `opts.on_done(parts, succeeded, has_self)`, if given, gets the
--- summary instead of it being shown (Import appends its GitHub installs).
+-- the summary. `opts.progress`, if given, is a progress dialog the caller
+-- owns (and closes): Install everything keeps one for plugins and patches.
+-- `opts.on_done(parts, succeeded, has_self, stopped)`, if given, gets the
+-- summary instead of it being shown (Import appends its GitHub installs);
+-- `stopped` is true when the user pressed Stop.
 function PluginManager:_runBulkInstall(manifest, to_process, opts)
     opts = opts or {}
     local installed = self:scanInstalled()
@@ -2996,26 +3468,28 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
     -- about to be processed, every run.
     local to_process_ids = {}
     for _, p in ipairs(to_process) do to_process_ids[p.id] = true end
-    local needed_libs = {}
+    local needed_libs, lib_order = {}, {}
     for _, p in ipairs(manifest.plugins) do
-        if p.common_lib and manifest[p.common_lib] and (installed[p.id] or to_process_ids[p.id]) then
+        if p.common_lib and manifest[p.common_lib] and (installed[p.id] or to_process_ids[p.id])
+           and not needed_libs[p.common_lib] then
             needed_libs[p.common_lib] = true
+            lib_order[#lib_order + 1] = p.common_lib
         end
     end
-    for lib_key in pairs(needed_libs) do
-        local ok, err = safe_call(function()
-            return self:ensureCommon(manifest, lib_key, opts.force_common)
-        end)
-        if not ok then
-            logger.warn("PluginManager: " .. lib_key .. " error:", err)
-            local text = _("Shared library error:") .. "\n" .. (err or "?")
-            -- A caller with more to do after the plugins (Import's GitHub
-            -- installs, Install everything's patches) still gets to run it,
-            -- with this error at the top of its summary.
-            if opts.on_done then return opts.on_done({ text }, 0, false) end
-            UIManager:show(InfoMessage:new{ text = text, timeout = 5 })
-            return
-        end
+
+    local total    = #to_process
+    local failed   = {}
+    local has_self = false
+
+    local own_progress = not opts.progress
+    local progress = opts.progress or self:_openProgress(total == 0 and _("Checking for updates\u{2026}")
+        or string.format(opts.progress_text or _("Updating %d plugin(s)\u{2026}"), total))
+    local release = awake_guard()
+
+    -- Every way out of the run goes through here first.
+    local function leave()
+        if own_progress then progress:close() end
+        release()
     end
 
     local function skipped_line(parts)
@@ -3024,7 +3498,7 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
         end
     end
 
-    if #to_process == 0 then
+    local function nothing_to_do()
         local removed_renamed = safe_call(function() return self:_cleanupRenamed(manifest) end) or {}
         local parts = {}
         parts[#parts + 1] = opts.nothing_to_do_text or _("All plugins are up to date.")
@@ -3032,23 +3506,26 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
             parts[#parts + 1] = string.format(_("Removed superseded %s."), fullname)
         end
         skipped_line(parts)
+        leave()
         self:refreshHome()
-        if opts.on_done then return opts.on_done(parts, 0, false) end
+        if opts.on_done then return opts.on_done(parts, 0, false, false) end
         UIManager:show(InfoMessage:new{
             text    = table.concat(parts, "\n"),
             timeout = 4,
         })
-        return
     end
 
-    local total    = #to_process
-    local failed   = {}
-    local has_self = false
-
-    local function finish()
+    -- `done`: how many plugins were attempted.
+    local function finish(done, stopped)
         local removed_renamed = safe_call(function() return self:_cleanupRenamed(manifest) end) or {}
         local parts = {}
-        if #failed > 0 then
+        if stopped then
+            parts[#parts + 1] = string.format(_("Stopped after %d/%d."), done, total)
+            if #failed > 0 then
+                parts[#parts + 1] = _("Failures:")
+                for _, f in ipairs(failed) do parts[#parts + 1] = f end
+            end
+        elseif #failed > 0 then
             parts[#parts + 1] = string.format(
                 _("%d/%d done. Failures:"), total - #failed, total)
             for _, f in ipairs(failed) do parts[#parts + 1] = f end
@@ -3059,51 +3536,73 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
             parts[#parts + 1] = string.format(_("Removed superseded %s."), fullname)
         end
         skipped_line(parts)
-        local succeeded = total - #failed
+        local succeeded = done - #failed
+        leave()
         self:refreshHome()
-        if opts.on_done then return opts.on_done(parts, succeeded, has_self) end
+        if opts.on_done then return opts.on_done(parts, succeeded, has_self, stopped) end
         self:_showSummary(parts, succeeded > 0, has_self)
     end
 
     local function step(i)
-        if i > total then finish() return end
-        local p   = to_process[i]
-        local msg = InfoMessage:new{
-            text = string.format(_("%d/%d  %s\u{2026}"), i, total, p.fullname),
-        }
-        UIManager:show(msg)
+        if i > total then return finish(total, false) end
+        if progress:stopped() then return finish(i - 1, true) end
+        local p = to_process[i]
+        progress:update(string.format(_("%d/%d \u{00b7} %s"), i, total, p.fullname or p.id))
+        -- A short delay rather than nextTick: the dialog repaints, and a tap
+        -- on Stop made during the previous plugin is read, before the next
+        -- one starts.
         UIManager:scheduleIn(0.1, function()
-            UIManager:close(msg)
-            local ok, err = safe_call(function() return self:installPlugin(p, manifest) end)
-            if not ok then
-                logger.warn("PluginManager: install failed for", p.id, ":", err)
-                failed[#failed + 1] = p.fullname .. ": " .. (err or "?")
-            elseif p.id == "pluginmanager" then
-                has_self = true
-            end
-            -- Each fetch accumulates response-body strings that only
-            -- become collectible once installPlugin returns; forcing a
-            -- cycle here (rather than waiting for Lua to decide it's
-            -- needed) matters on memory-constrained e-ink hardware during
-            -- a long bulk run (Reinstall All processes every installed
-            -- plugin, potentially dozens) -- letting memory pressure build
-            -- across the whole batch is exactly what previously crashed
-            -- KOReader mid-write and left a plugin's directory with only
-            -- some of its files, which then failed to load at all afterward.
-            collectgarbage("collect")
-            -- Always advance, even after a failure above: one broken
-            -- plugin must not stop the rest of a bulk run.
-            step(i + 1)
+            run_async(function() return self:installPlugin(p, manifest) end, function(ok, err)
+                if not ok then
+                    logger.warn("PluginManager: install failed for", p.id, ":", err)
+                    failed[#failed + 1] = (p.fullname or p.id) .. ": " .. (err or "?")
+                elseif p.id == "pluginmanager" then
+                    has_self = true
+                end
+                -- Each fetch accumulates response-body strings that only
+                -- become collectible once installPlugin returns; forcing a
+                -- cycle here (rather than waiting for Lua to decide it's
+                -- needed) matters on memory-constrained e-ink hardware during
+                -- a long bulk run (Reinstall All processes every installed
+                -- plugin, potentially dozens) -- letting memory pressure build
+                -- across the whole batch is exactly what previously crashed
+                -- KOReader mid-write and left a plugin's directory with only
+                -- some of its files, which then failed to load at all afterward.
+                collectgarbage("collect")
+                -- Always advance, even after a failure above: one broken
+                -- plugin must not stop the rest of a bulk run.
+                step(i + 1)
+            end)
         end)
     end
 
-    local init_msg = InfoMessage:new{
-        text = string.format(opts.progress_text or _("Updating %d plugin(s)\u{2026}"), total),
-    }
-    UIManager:show(init_msg)
+    if #lib_order > 0 then progress:update(_("Shared libraries\u{2026}")) end
     UIManager:scheduleIn(0.2, function()
-        UIManager:close(init_msg)
-        step(1)
+        run_async(function()
+            for _i, lib_key in ipairs(lib_order) do
+                local ok, err = safe_call(function()
+                    return self:ensureCommon(manifest, lib_key, opts.force_common)
+                end)
+                if not ok then
+                    logger.warn("PluginManager: " .. lib_key .. " error:", err)
+                    return false, err
+                end
+            end
+            return true
+        end, function(ok, err)
+            if not ok then
+                local text = _("Shared library error:") .. "\n" .. (err or "?")
+                leave()
+                -- A caller with more to do after the plugins (Import's GitHub
+                -- installs, Install everything's patches) still gets to run it,
+                -- with this error at the top of its summary.
+                if opts.on_done then return opts.on_done({ text }, 0, false, false) end
+                UIManager:show(InfoMessage:new{ text = text, timeout = 5 })
+                return
+            end
+            if total == 0 then return nothing_to_do() end
+            step(1)
+        end)
     end)
 end
 
@@ -3529,17 +4028,33 @@ end
 -- safe_call so a bad file cannot stop the rest; then on_done(succeeded,
 -- failed), failed being "name: error" lines. Shared by "Install all N
 -- patches" and Install everything.
-function PluginManager:_installPatchBatch(items, on_done)
+-- `progress`, if given, is a bulk run's progress dialog (Install
+-- everything): the batch reports into it and honours its Stop button, and
+-- on_done gets a third argument, true when stopped.
+function PluginManager:_installPatchBatch(items, on_done, progress)
+    local release = awake_guard()
     local total, failed = #items, {}
     local function step(i)
-        if i > total then return on_done(total - #failed, failed) end
+        if i > total then
+            release()
+            return on_done(total - #failed, failed, false)
+        end
+        if progress and progress:stopped() then
+            release()
+            return on_done(i - 1 - #failed, failed, true)
+        end
         local item = items[i]
-        local msg  = InfoMessage:new{
-            text = string.format(_("%d/%d  %s\u{2026}"), i, total, item.name),
-        }
-        UIManager:show(msg)
+        local msg
+        if progress then
+            progress:update(string.format(_("%d/%d \u{00b7} %s"), i, total, item.name))
+        else
+            msg = InfoMessage:new{
+                text = string.format(_("%d/%d  %s\u{2026}"), i, total, item.name),
+            }
+            UIManager:show(msg)
+        end
         UIManager:scheduleIn(0.1, function()
-            UIManager:close(msg)
+            if msg then UIManager:close(msg) end
             local ok, err = safe_call(function() return self:installPatchFile(item) end)
             if not ok then failed[#failed + 1] = item.name .. ": " .. (err or "?") end
             step(i + 1)
@@ -3700,14 +4215,32 @@ end
 -- shared-library error), and its own failures are added to the plugin
 -- results rather than replacing them.
 function PluginManager:_runInstallEverything(manifest, plan, patch_plan, repo_results)
+    -- Held across both halves, and one progress dialog for both.
+    local release = awake_guard()
     self:_refreshDiscoverLinkedVersions(plan.installed, function()
+        local progress = self:_openProgress(#plan.to_process == 0 and _("Checking for updates\u{2026}")
+            or string.format(_("Updating %d plugin(s)\u{2026}"), #plan.to_process))
+        local function summary(parts, needs_restart, has_self)
+            progress:close()
+            release()
+            self:_showSummary(parts, needs_restart, has_self)
+        end
         self:_runBulkInstall(manifest, plan.to_process, {
-            skipped = plan.skipped,
-            on_done = function(parts, succeeded, has_self)
-                local function finish(p_succeeded, p_failed)
+            skipped  = plan.skipped,
+            progress = progress,
+            on_done  = function(parts, succeeded, has_self, stopped)
+                -- Stop ends the whole run: the patches are not started.
+                if stopped then return summary(parts, succeeded > 0, has_self) end
+                local function finish(p_succeeded, p_failed, p_stopped)
                     if #repo_results > 0 then
                         local total = #patch_plan.install
-                        if total == 0 then
+                        if p_stopped then
+                            parts[#parts + 1] = string.format(_("Patches: stopped after %d/%d."), p_succeeded + #p_failed, total)
+                            if #p_failed > 0 then
+                                parts[#parts + 1] = _("Failures:")
+                                for _i, f in ipairs(p_failed) do parts[#parts + 1] = f end
+                            end
+                        elseif total == 0 then
                             parts[#parts + 1] = _("All patches are up to date.")
                         elseif #p_failed > 0 then
                             parts[#parts + 1] = string.format(_("Patches: %d/%d installed. Failures:"), p_succeeded, total)
@@ -3726,15 +4259,16 @@ function PluginManager:_runInstallEverything(manifest, plan, patch_plan, repo_re
                             parts[#parts + 1] = string.format(_("Could not list patches from %s: %s"), r.full_name, r.err)
                         end
                     end
-                    self:_showSummary(parts, succeeded + p_succeeded > 0, has_self)
+                    summary(parts, succeeded + p_succeeded > 0, has_self)
                 end
+                progress.heading = _("Patches")
                 local ok, err = safe_call(function()
-                    self:_installPatchBatch(patch_plan.install, finish)
+                    self:_installPatchBatch(patch_plan.install, finish, progress)
                     return true
                 end)
                 if not ok then
                     parts[#parts + 1] = _("Install failed:") .. " " .. (err or "?")
-                    self:_showSummary(parts, succeeded > 0, has_self)
+                    summary(parts, succeeded > 0, has_self)
                 end
             end,
         })
@@ -4466,17 +5000,20 @@ function PluginManager:confirmImport()
 end
 
 function PluginManager:_runImport(manifest, to_install, github, skipped)
+    local release = awake_guard()  -- across both halves
     self:_runBulkInstall(manifest, to_install, {
         nothing_to_do_text = _("No plugin to install from the repository."),
         done_text          = _("%d plugin(s) installed."),
         progress_text      = _("Installing %d plugin(s)\u{2026}"),
         skipped            = skipped,
-        on_done            = function(parts, succeeded, has_self)
-            if #github == 0 then
+        on_done            = function(parts, succeeded, has_self, stopped)
+            if #github == 0 or stopped then
+                release()
                 return self:_showSummary(parts, succeeded > 0, has_self)
             end
             self:installAllFromGithub(github, function(gparts, gsucceeded)
                 for _i, line in ipairs(gparts) do parts[#parts + 1] = line end
+                release()
                 self:_showSummary(parts, succeeded + gsucceeded > 0, has_self)
             end)
         end,

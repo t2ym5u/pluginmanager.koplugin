@@ -3,6 +3,35 @@
 All notable changes to this project will be documented in this file.
 
 
+## [1.7.0] - 2026-11-03
+
+### Fixed
+- Install everything / Update / Reinstall all no longer seem to freeze. A
+  full run used to download all ~110 plugins file by file (over a thousand
+  separate downloads) with the screen frozen on each plugin; on a slow reader
+  it took long enough for the reader to go to sleep mid-way, which cut Wi-Fi
+  and stalled the run.
+
+### Changed
+- Much faster installs: each plugin now comes as one download (the ready
+  zip the repository publishes for it), checked as a whole against the
+  plugin list's SHA-256 and size, with every `.lua` still compile-checked
+  before anything is installed. The shared libraries are refreshed the same
+  way. On a test of 11 plugins: 4 s instead of 65 s. If a zip is missing,
+  does not match (for example just after a release, while GitHub still
+  serves the previous one) or is damaged, that plugin is downloaded file by
+  file as before. Single-plugin installs and updates use it too.
+- One progress window for the whole run ("12/110 · Boggle") instead of a new
+  message per plugin, with a **Stop** button: the plugin in progress is
+  finished, then the run ends with its summary ("Stopped after 12/110").
+  With Install everything, Stop also skips the patches.
+- The reader stays awake during Update, Reinstall all, Install everything
+  and Import (no automatic sleep or standby until the run is over), then
+  sleeps normally again.
+- Downloads give up after a time limit (15 s without any progress; 20 s
+  for a file, a minute or more for a plugin zip, depending on its size) instead of waiting on a dead connection,
+  and the run carries on with the next plugin.
+
 ## [1.6.0] - 2026-10-30
 
 ### Added
