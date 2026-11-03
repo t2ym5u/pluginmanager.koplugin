@@ -23,7 +23,9 @@ A plugin manager for [KOReader](https://github.com/koreader/koreader) that lets 
 - **What's new** — before updating, read only the changelog entries between your version and the new one
 - **Categories** — the plugin list is split into sections (logic puzzles, sudoku, word games, board games…), with a category filter
 - **Restore previous version** — an update keeps the version it replaced, one tap brings it back
-- **Integrity check** — every downloaded file is checked against the plugin list's SHA-256, and every `.lua` must compile, before anything is installed
+- **Integrity check** — every download is checked against the plugin list's SHA-256, and every `.lua` must compile, before anything is installed
+- **One download per plugin** — each plugin is installed from the ready zip the repository publishes for it, instead of file by file (much faster on a slow reader)
+- **Progress and Stop** — a bulk run shows one progress window (*12/110 · Boggle*) with a **Stop** button, and keeps the reader awake until it is done
 - **Minimum KOReader version** — a plugin that needs a newer KOReader is flagged, asks before installing, and is skipped by bulk updates
 - **Export / import** — save the list of installed plugins to a file and reinstall the same set on another reader
 
@@ -81,7 +83,7 @@ A plugin whose new version needs a newer KOReader than yours shows `(vX needs KO
 
 ## How it works
 
-The plugin manager downloads a `manifest.json` file from the repository root. This file lists every available plugin along with its version and the individual source files it contains. Files are then fetched one by one from `raw.githubusercontent.com` and written directly to the KOReader `plugins/` directory.
+The plugin manager downloads a `manifest.json` file from the repository root. This file lists every available plugin along with its version, the individual source files it contains and, since 1.7.0, the ready zip the repository publishes for it (`zip`: `dist/<id>.zip` with its SHA-256 and size, written by `update_manifest.py`). A plugin is installed from that one zip; only when the zip is missing, does not match its hash or size (e.g. the CDN still serving the previous release's zip for a few minutes), is damaged, or lacks a listed file, are its files fetched one by one from `raw.githubusercontent.com` as before. Only the plugin's own listed files are taken from the zip, and an archive containing any entry that would land outside the target (`../`) is refused whole.
 
 Two shared libraries exist for plugins that vendor common code instead of duplicating it: `game-common` (ScreenBase-based games) and `sudoku-common` (BaseScreen-based sudoku variants — a different, incompatible API). A plugin's `common_lib` field in `manifest.json` names which one it needs. The named library is downloaded automatically the first time any plugin that depends on it is installed, and copied into that plugin's `common/` folder (a real copy, never a symlink, so it survives on any device); it's refreshed on every install/update to guarantee it's never stale.
 
@@ -115,7 +117,13 @@ Out of scope: the shared libraries themselves (`plugins/game-common/`, `plugins/
 
 A plugin can declare `min_koreader = "2026.03"` in its `_meta.lua`; `update_manifest.py` copies it into the plugin list. Plugin Manager compares it with the running KOReader (`frontend/version.lua`): an incompatible plugin is flagged in the list and in its dialog, installing or updating it asks for confirmation (**Install anyway**), and **Update**, **Reinstall all** and **Import** skip it, naming it in their summary. A KOReader that does not know its own version (development builds) is treated as compatible.
 
-Files are fetched with a short pacing delay between requests, and a 429 (rate limit) from `raw.githubusercontent.com` is retried with backoff rather than failing the whole update — useful during a bulk Update/Reinstall run that touches every installed plugin.
+Files are fetched with a short pacing delay between requests, and a 429 (rate limit) from `raw.githubusercontent.com` is retried with backoff rather than failing the whole update — useful during a bulk Update/Reinstall run that touches every installed plugin. Every request has a time limit (KOReader's `socketutil`: 15 s without progress, 20 s in all for a file, 60 s plus 1 s per 32 KB for a zip), so a dead connection fails that one plugin and the run moves on.
+
+### Bulk runs: progress, Stop, staying awake
+
+**Update**, **Reinstall all**, **Install everything** and **Import** show one progress window for the whole run (*Updating 110 plugin(s)… — 12/110 · Boggle*), updated in place. **Stop** finishes the plugin in progress, then ends the run with its usual summary (*Stopped after 12/110*); Install everything then skips the patches. The interface is given back between plugins (and between files when a plugin falls back to per-file downloads), which is when the tap on Stop is read.
+
+For the duration of the run the reader does not go to sleep or standby — KOReader's autosuspend would otherwise suspend a Kobo after 15 minutes without a tap, cutting Wi-Fi mid-run. Plugin Manager sets the same `PluginShare.pause_auto_suspend` flag the Keep alive plugin uses and holds `UIManager:preventStandby()`, and gives both back when the run ends, however it ends (done, error, Stop).
 
 ## Discover plugins (third-party repos)
 
@@ -239,14 +247,15 @@ Use a **classic** token (Settings → Developer settings → Personal access tok
 1. Bump `version` in the plugin's `_meta.lua` (and, if it needs a recent KOReader, add `min_koreader = "YYYY.MM"`).
 2. Commit and push the plugin's own repository.
 3. Regenerate `manifest.json` at the monorepo root with `python3 .github/scripts/update_manifest.py`: it rewrites the plugin's `version`, `files`, `sha256` (hashed from the plugin's committed files), `category` (from `.github/scripts/categories.json` — add new plugins there) and `min_koreader`. `--output PATH` writes the result elsewhere to check it first.
-4. Commit and push `manifest.json`. Until it is pushed, devices see the hashes of the previous commit; the drift rule above lets those installs through.
+4. Rebuild the zips with `./scripts/build_release.sh`, then run `update_manifest.py` **again**: every build rewrites the zips, and this second pass records their new `zip` hashes and sizes.
+5. Commit and push `manifest.json` and `dist/` together. Until they are pushed, devices see the hashes of the previous commit; the drift rule above lets per-file installs through, and a zip that does not match simply falls back to per-file.
 
 ## Requirements
 
 - KOReader with network access (Wi-Fi or mobile data)
 - `ssl.https` and `ltn12` (bundled with KOReader on all supported devices)
 - `rapidjson` for JSON parsing (bundled with KOReader)
-- `ffi/archiver` for extracting Discover's zip downloads (bundled with KOReader)
+- `ffi/archiver` for extracting plugin zips and Discover's zip downloads (bundled with KOReader)
 
 ## Localization
 

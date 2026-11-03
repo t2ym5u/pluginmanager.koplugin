@@ -289,4 +289,13 @@ return {
     ["All patches are up to date."] = { fr = "Tous les patchs sont à jour.", es = "Todos los parches están actualizados.", de = "Alle Patches sind aktuell." },
     ["Patches: %d/%d installed. Failures:"] = { fr = "Patchs : %d/%d installés. Échecs :", es = "Parches: %d/%d instalados. Errores:", de = "Patches: %d/%d installiert. Fehler:" },
     ["%d patch(es) installed."]   = { fr = "%d patch(s) installé(s).", es = "%d parche(s) instalado(s).", de = "%d Patch(es) installiert." },
+
+    -- 1.7.0: bulk run progress dialog
+    ["Stop"]                      = { fr = "Arrêter", es = "Detener", de = "Stopp" },
+    ["Stopping after the current one\u{2026}"] = { fr = "Arrêt après celui en cours…", es = "Se detendrá tras el actual…", de = "Stopp nach dem aktuellen…" },
+    ["Stopped after %d/%d."]      = { fr = "Arrêté après %d/%d.", es = "Detenido tras %d/%d.", de = "Gestoppt nach %d/%d." },
+    ["Patches: stopped after %d/%d."] = { fr = "Patchs : arrêt après %d/%d.", es = "Parches: detenido tras %d/%d.", de = "Patches: gestoppt nach %d/%d." },
+    ["Failures:"]                 = { fr = "Échecs :", es = "Errores:", de = "Fehler:" },
+    ["%d/%d \u{00b7} %s"]          = { fr = "%d/%d · %s", es = "%d/%d · %s", de = "%d/%d · %s" },
+    ["Shared libraries\u{2026}"]  = { fr = "Bibliothèques partagées…", es = "Bibliotecas compartidas…", de = "Gemeinsame Bibliotheken…" },
 }

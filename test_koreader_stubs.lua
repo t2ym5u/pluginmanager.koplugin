@@ -46,13 +46,58 @@ package.preload["ui/widget/confirmbox"]   = function() return widget("ConfirmBox
 package.preload["ui/widget/buttondialog"] = function() return widget("ButtonDialog") end
 package.preload["ui/widget/inputdialog"]  = function() return widget("InputDialog") end
 
+-- Standby / autosuspend holds, counted so a spec can check that every run
+-- gives back what it took (see awake_guard in main.lua).
+H.standby_prevented = 0
+H.input_events = 0
+H.pluginshare = {}
+package.preload["pluginshare"] = function() return H.pluginshare end
 package.preload["ui/uimanager"] = function()
   return {
     show = function() end, close = function() end,
     scheduleIn = function(_, _, fn) H.queue[#H.queue + 1] = fn end,
     nextTick   = function(_, fn)    H.queue[#H.queue + 1] = fn end,
     setDirty = function() end,
+    preventStandby = function() H.standby_prevented = H.standby_prevented + 1 end,
+    allowStandby   = function()
+      assert(H.standby_prevented > 0, "allowStandby without preventStandby")
+      H.standby_prevented = H.standby_prevented - 1
+    end,
+    event_hook = { execute = function(_, name)
+      if name == "InputEvent" then H.input_events = H.input_events + 1 end
+    end },
   }
+end
+
+-- ffi/archiver, backed by the unzip command line tool: enough of
+-- Archiver.Reader (open / iterate / extractToPath / close) for real zip files
+-- built by a spec. A corrupt file fails to open, as with libarchive.
+package.preload["ffi/archiver"] = function()
+  local Reader = {}
+  Reader.__index = Reader
+  function Reader:new() return setmetatable({}, Reader) end
+  function Reader:open(path)
+    local p = io.popen(("unzip -Z1 %s 2>/dev/null; echo \"rc=$?\""):format(q(path)))
+    local out = p:read("*a"); p:close()
+    if not out:find("rc=0", 1, true) then return nil end
+    self.path, self.list = path, {}
+    for line in out:gmatch("[^\n]+") do
+      if not line:match("^rc=") then
+        self.list[#self.list + 1] = { path = line, mode = line:sub(-1) == "/" and "directory" or "file" }
+      end
+    end
+    return true
+  end
+  function Reader:iterate()
+    local i = 0
+    return function() i = i + 1; return self.list[i] end
+  end
+  function Reader:extractToPath(name, dest)
+    local rc = os.execute(("unzip -p %s %s > %s 2>/dev/null"):format(q(self.path), q(name), q(dest)))
+    return rc == true or rc == 0
+  end
+  function Reader:close() self.list = nil end
+  return { Reader = Reader }
 end
 package.preload["ui/widget/container/widgetcontainer"] = function()
   local WC = {}
@@ -90,9 +135,17 @@ end
 -- Network -----------------------------------------------------------------
 package.preload["socket"] = function() return { sleep = function() end } end
 package.preload["ltn12"]  = function()
-  return { sink = { table = function(t)
-             return function(chunk) if chunk then t[#t + 1] = chunk end return 1 end
-           end } }
+  return { sink = {
+    table = function(t)
+      return function(chunk) if chunk then t[#t + 1] = chunk end return 1 end
+    end,
+    file = function(handle)
+      return function(chunk)
+        if chunk then handle:write(chunk) else handle:close() end
+        return 1
+      end
+    end,
+  } }
 end
 package.preload["ssl.https"] = function()
   return { request = function(req)
