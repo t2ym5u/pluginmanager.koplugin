@@ -435,6 +435,7 @@ end
 local function looks_like_koreader_plugin(repo)
     local name = json_str(repo.name):lower()
     local desc = json_str(repo.description):lower()
+    if PMLogic.isTemplate(name) then return false end  -- _skeleton.koplugin
     return name:match("%.koplugin$") ~= nil
         or desc:find("koreader", 1, true) ~= nil
         or desc:find("koplugin", 1, true) ~= nil
@@ -554,7 +555,8 @@ end
 -- covers even a very prolific account.
 function PluginManager:listGithubOwnerPlugins(owner)
     return list_owner_repos(owner, function(repo)
-        return json_str(repo.name):match("%.koplugin$") ~= nil
+        local name = json_str(repo.name)
+        return name:match("%.koplugin$") ~= nil and not PMLogic.isTemplate(name)
     end)
 end
 
@@ -754,6 +756,13 @@ function PluginManager:_silentCheck()
 
     local n_update = #self:pendingUpdates(manifest)
     self:refreshHome()
+    local n_unwanted = #self:scanUnwanted()
+    if n_unwanted > 0 then
+        UIManager:show(InfoMessage:new{
+            text    = string.format(_("Plugin Manager: %d outdated plugin(s) should be removed. They can make other games crash."), n_unwanted),
+            timeout = 8,
+        })
+    end
     if n_update > 0 then
         UIManager:show(InfoMessage:new{
             text    = string.format(_("Plugin Manager: %d update(s) available."), n_update),
@@ -1387,6 +1396,10 @@ end
 -- 3. The version being replaced is kept for roll back, then the staged
 --    files are moved into place.
 function PluginManager:installPlugin(plugin_info, manifest)
+    -- A template (_skeleton.koplugin) is never installed, whatever lists it.
+    if PMLogic.isTemplate(plugin_info.id) or PMLogic.isTemplate(plugin_info.dir) then
+        return false, string.format(_("Refused: %s is a template, not a plugin."), tostring(plugin_info.dir))
+    end
     local plugin_dir = PathGuard.pluginPath(_plugins_dir, plugin_info.dir)
     local stage      = staging_path(plugin_info.dir)
     if not plugin_dir or not stage then
@@ -1718,6 +1731,14 @@ function PluginManager:installFromGithubRepo(repo, on_done)
             return
         end
 
+        if PMLogic.isTemplate(layout.dirname) then
+            reader:close()
+            os.remove(zip_path)
+            local terr = string.format(_("Refused: %s is a template, not a plugin."), layout.dirname)
+            UIManager:show(InfoMessage:new{ text = terr, timeout = 5 })
+            if on_done then on_done(false, terr) end
+            return
+        end
         local dest_dir = _plugins_dir .. "/" .. layout.dirname
 
         local function proceed()
@@ -2206,6 +2227,92 @@ function PluginManager:_cleanupRenamed(manifest)
         end
     end
     return removed
+end
+
+-- ---------------------------------------------------------------------------
+-- Retired plugins and templates
+-- ---------------------------------------------------------------------------
+
+-- Installed plugins that must go (PMLogic.unwantedPlugins): ones retired from
+-- the catalogue, which nothing else here ever touches again -- "Remove all"
+-- and Update only act on manifest plugins, and the list shows them as
+-- "(local)" like any third-party plugin -- and the _skeleton template. Every
+-- *.koplugin directory counts, with or without a _meta.lua.
+function PluginManager:scanUnwanted()
+    local lfs = get_lfs()
+    if not lfs then return {} end
+    local dirs = {}
+    pcall(function()
+        for entry in lfs.dir(_plugins_dir) do
+            if entry:match("%.koplugin$")
+               and lfs.attributes(_plugins_dir .. "/" .. entry, "mode") == "directory" then
+                dirs[#dirs + 1] = entry
+            end
+        end
+    end)
+    local list = PMLogic.unwantedPlugins(dirs, self:getManifest())
+    for _i, u in ipairs(list) do
+        local meta = read_meta(_plugins_dir .. "/" .. u.dir .. "/_meta.lua")
+        u.fullname = (meta and meta.fullname) or u.id
+        u.version  = meta and meta.version
+    end
+    return list
+end
+
+local function unwanted_line(u)
+    local why = u.reason == "template"
+        and _("developer template, not a plugin")
+        or  _("retired from the catalogue")
+    return string.format("\u{2022} %s (%s): %s", u.fullname, u.dir, why)
+end
+
+function PluginManager:showUnwantedDialog(list)
+    list = list or self:scanUnwanted()
+    if #list == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No outdated plugins found."), timeout = 3 })
+        return
+    end
+    local lines = {}
+    for _i, u in ipairs(list) do lines[#lines + 1] = unwanted_line(u) end
+    UIManager:show(ConfirmBox:new{
+        text = _("These plugins should not be installed:") .. "\n\n"
+            .. table.concat(lines, "\n") .. "\n\n"
+            .. _("Retired plugins get no more updates, and KOReader still loads them at every start: their outdated shared code can make other games crash when opened. A template is not a plugin.\nRemove them? All their files will be deleted."),
+        ok_text     = _("Remove"),
+        ok_callback = function() self:removeUnwanted(list) end,
+    })
+end
+
+-- Deletes each directory of `list` (and its kept backup), then checks it is
+-- really gone: a partly deleted plugin is the worst outcome -- invisible
+-- here once its _meta.lua is gone, still loaded by KOReader.
+function PluginManager:removeUnwanted(list)
+    local lfs = get_lfs()
+    local removed, failed = 0, {}
+    for _i, u in ipairs(list) do
+        local path = PathGuard.pluginPath(_plugins_dir, u.dir)
+        if path then
+            rm_rf(path)
+            local backup = backup_path(u.dir)
+            if backup then rm_rf(backup) end
+            self:forgetDiscoverInstall(u.id)
+        end
+        if not path or (lfs and lfs.attributes(_plugins_dir .. "/" .. u.dir, "mode")) then
+            failed[#failed + 1] = u.dir
+        else
+            removed = removed + 1
+        end
+    end
+    self:refreshHome()
+    local text = string.format(_("%d plugin(s) removed."), removed)
+    if #failed > 0 then
+        text = text .. "\n" .. _("Could not remove:") .. "\n" .. table.concat(failed, "\n")
+    end
+    if removed > 0 then
+        self:askRestart(text .. "\n" .. _("Please restart KOReader."))
+    else
+        UIManager:show(InfoMessage:new{ text = text, timeout = 5 })
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -3145,11 +3252,19 @@ function PluginManager:showPluginList()
             end
         end
         -- Locally installed but absent from manifest
+        -- (retired ones and templates tagged as such: see scanUnwanted)
+        local installed_dirs, unwanted = {}, {}
+        for _id, inst in pairs(installed) do installed_dirs[#installed_dirs + 1] = inst.dir end
+        for _i, u in ipairs(PMLogic.unwantedPlugins(installed_dirs, self:getManifest())) do
+            unwanted[u.id] = u.reason
+        end
         for id, inst in pairs(installed) do
             if not known_ids[id] then
                 local iref          = inst
                 local repo          = self:getDiscoverInstall(id)
-                local tag           = repo and _("(GitHub)") or _("(local)")
+                local tag           = (unwanted[id] == "retired" and _("(retired)"))
+                    or (unwanted[id] == "template" and _("(template)"))
+                    or (repo and _("(GitHub)") or _("(local)"))
                 local remote_version = repo and self:getDiscoverUpdateCache(id)
                 local has_update    = remote_version
                     and is_newer(inst.version, remote_version)
@@ -4763,7 +4878,7 @@ function PluginManager:updateEntryText()
 end
 
 function PluginManager:homeEntries()
-    return {
+    local entries = {
         { text = self:updateEntryText(), callback = function() self:doFullUpdate() end },
         { text = _("Install everything\u{2026}"), callback = function() self:doInstallEverything() end },
         {
@@ -4793,6 +4908,16 @@ function PluginManager:homeEntries()
         { text = _("Export installed list"),           callback = function() self:exportInstalled() end },
         { text = _("Import list\u{2026}"),             callback = function() self:confirmImport() end },
     }
+    -- Retired plugins / templates still on the device: offered first, and
+    -- only while there are some (PluginManager:scanUnwanted).
+    local unwanted = self:scanUnwanted()
+    if #unwanted > 0 then
+        table.insert(entries, 1, {
+            text     = string.format(_("Remove outdated plugins (%d)\u{2026}"), #unwanted),
+            callback = function() self:showUnwantedDialog() end,
+        })
+    end
+    return entries
 end
 
 function PluginManager:showMainDialog()
