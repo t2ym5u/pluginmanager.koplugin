@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.3] - 2026-11-04
+
+### Fixed
+- Plugins taken out of the catalogue (Mots fléchés/arrowwords, Kakuro, Start
+  menu, Boggle party, Double or nothing) could stay on the reader for good:
+  once gone from the plugin list they were treated like any third-party
+  plugin -- never updated, skipped by "Remove all" -- while KOReader kept
+  loading them at every start. An old arrowwords left that way made every
+  game crash when opened ("getGutter (a nil value)"). Plugin Manager now
+  finds them (the catalogue's new `retired` list, or a built-in one when the
+  catalogue is older or not downloaded yet), says so when it checks for
+  updates, and offers "Remove outdated plugins (N)…" first on its home
+  screen, which deletes their folders for real and checks they are gone. A
+  folder that lost its _meta.lua but still has its code is found too. The
+  plugin list tags them "(retired)".
+- The `_skeleton` developer template is found and offered for removal the
+  same way, and is never installed: refused from the catalogue, from an
+  import or a bulk install, and from Discover (where it is no longer
+  listed).
+
 ## [1.7.2] - 2026-11-04
 
 ### Changed

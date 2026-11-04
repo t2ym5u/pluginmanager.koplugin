@@ -298,4 +298,26 @@ return {
     ["Failures:"]                 = { fr = "Échecs :", es = "Errores:", de = "Fehler:" },
     ["%d/%d \u{00b7} %s"]          = { fr = "%d/%d · %s", es = "%d/%d · %s", de = "%d/%d · %s" },
     ["Shared libraries\u{2026}"]  = { fr = "Bibliothèques partagées…", es = "Bibliotecas compartidas…", de = "Gemeinsame Bibliotheken…" },
+
+    -- Retired plugins and templates (1.7.3)
+    ["developer template, not a plugin"] = { fr = "modèle pour développeurs, pas un plugin", es = "plantilla para desarrolladores, no un plugin", de = "Entwicklervorlage, kein Plugin" },
+    ["retired from the catalogue"] = { fr = "retiré du catalogue", es = "retirado del catálogo", de = "aus dem Katalog entfernt" },
+    ["No outdated plugins found."] = { fr = "Aucun plugin obsolète trouvé.", es = "No se encontraron plugins obsoletos.", de = "Keine veralteten Plugins gefunden." },
+    ["These plugins should not be installed:"] = { fr = "Ces plugins ne devraient pas être installés :", es = "Estos plugins no deberían estar instalados:", de = "Diese Plugins sollten nicht installiert sein:" },
+    ["Retired plugins get no more updates, and KOReader still loads them at every start: their outdated shared code can make other games crash when opened. A template is not a plugin.\nRemove them? All their files will be deleted."] = {
+        fr = "Les plugins retirés ne reçoivent plus de mises à jour, et KOReader les charge toujours à chaque démarrage : leur code partagé obsolète peut faire planter les autres jeux à l'ouverture. Un modèle n'est pas un plugin.\nLes supprimer ? Tous leurs fichiers seront effacés.",
+        es = "Los plugins retirados ya no reciben actualizaciones, y KOReader los sigue cargando en cada inicio: su código compartido obsoleto puede hacer que otros juegos fallen al abrirse. Una plantilla no es un plugin.\n¿Eliminarlos? Se borrarán todos sus archivos.",
+        de = "Entfernte Plugins erhalten keine Updates mehr, und KOReader lädt sie trotzdem bei jedem Start: Ihr veralteter gemeinsamer Code kann andere Spiele beim Öffnen abstürzen lassen. Eine Vorlage ist kein Plugin.\nEntfernen? Alle ihre Dateien werden gelöscht.",
+    },
+    ["Could not remove:"]          = { fr = "Suppression impossible :", es = "No se pudo eliminar:", de = "Konnte nicht entfernt werden:" },
+    ["Please restart KOReader."]   = { fr = "Veuillez redémarrer KOReader.", es = "Reinicie KOReader.", de = "Bitte KOReader neu starten." },
+    ["Remove outdated plugins (%d)\u{2026}"] = { fr = "Supprimer les plugins obsolètes (%d)…", es = "Eliminar plugins obsoletos (%d)…", de = "Veraltete Plugins entfernen (%d)…" },
+    ["Plugin Manager: %d outdated plugin(s) should be removed. They can make other games crash."] = {
+        fr = "Gestionnaire de plugins : %d plugin(s) obsolète(s) à supprimer. Ils peuvent faire planter les autres jeux.",
+        es = "Gestor de plugins: %d plugin(s) obsoleto(s) que eliminar. Pueden hacer que otros juegos fallen.",
+        de = "Plugin-Manager: %d veraltete(s) Plugin(s) sollte(n) entfernt werden. Sie können andere Spiele abstürzen lassen.",
+    },
+    ["(retired)"]                  = { fr = "(retiré)", es = "(retirado)", de = "(entfernt)" },
+    ["(template)"]                 = { fr = "(modèle)", es = "(plantilla)", de = "(Vorlage)" },
+    ["Refused: %s is a template, not a plugin."] = { fr = "Refusé : %s est un modèle, pas un plugin.", es = "Rechazado: %s es una plantilla, no un plugin.", de = "Abgelehnt: %s ist eine Vorlage, kein Plugin." },
 }

@@ -481,4 +481,68 @@ function L.everythingCounts(n_update, n_new, repo_results, patch_plan)
     return c
 end
 
+-- ---------------------------------------------------------------------------
+-- Retired plugins and templates (plugins that must not stay installed)
+-- ---------------------------------------------------------------------------
+
+-- Plugins taken out of the catalogue. Once gone from manifest.json, an
+-- installed copy is listed like any third-party plugin, never updated, and
+-- left alone by "Remove all" -- while KOReader still loads it at every start.
+-- Its common/ is an old game-common, and the shared modules it loads first
+-- are the ones every other game then gets: an old arrowwords made every
+-- game crash on open (screen_base without getGutter).
+-- The manifest names them in its top-level `retired` list; this copy is for
+-- a manifest from before that field, or none at all (offline, first run).
+L.RETIRED_FALLBACK = { "arrowwords", "boggleparty", "doubleornothing", "kakuro", "startmenu" }
+
+-- A directory name or id starting with "_" is a template (the fleet's
+-- _skeleton.koplugin): a starting point for writing a plugin, never one to
+-- install. KOReader would load it like any other plugin.
+function L.isTemplate(name)
+    return type(name) == "string" and name:sub(1, 1) == "_"
+end
+
+-- The set of retired ids: the manifest's `retired` list when it has one
+-- (even an empty one: an id taken back into the catalogue must stop being
+-- flagged), else RETIRED_FALLBACK. An id the manifest still lists as a
+-- plugin is never retired, whatever either list says, and neither is
+-- Plugin Manager itself.
+function L.retiredIds(manifest)
+    local list = type(manifest) == "table" and manifest.retired
+    if type(list) ~= "table" then list = L.RETIRED_FALLBACK end
+    local set = {}
+    for _i, id in ipairs(list) do
+        if type(id) == "string" and id ~= "" then set[id] = true end
+    end
+    if type(manifest) == "table" and type(manifest.plugins) == "table" then
+        for _i, p in ipairs(manifest.plugins) do
+            if type(p) == "table" and type(p.id) == "string" then set[p.id] = nil end
+        end
+    end
+    set.pluginmanager = nil
+    return set
+end
+
+-- Which installed plugin directories should be removed. `dirs` are the
+-- names of the *.koplugin directories in the plugins folder -- all of them,
+-- whether or not they have a _meta.lua: a half-deleted plugin without one is
+-- invisible to the installed scan but KOReader still runs its main.lua.
+-- Returns { {id, dir, reason = "retired"|"template"}, ... } sorted by id.
+function L.unwantedPlugins(dirs, manifest)
+    local retired = L.retiredIds(manifest)
+    local out = {}
+    for _i, dir in ipairs(dirs or {}) do
+        local id = type(dir) == "string" and dir:match("^(.+)%.koplugin$")
+        if id then
+            if L.isTemplate(id) then
+                out[#out + 1] = { id = id, dir = dir, reason = "template" }
+            elseif retired[id] then
+                out[#out + 1] = { id = id, dir = dir, reason = "retired" }
+            end
+        end
+    end
+    table.sort(out, function(a, b) return a.id < b.id end)
+    return out
+end
+
 return L
