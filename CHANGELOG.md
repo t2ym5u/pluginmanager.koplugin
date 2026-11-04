@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.2] - 2026-11-04
+
+### Changed
+- Opening or closing a book no longer re-reads Plugin Manager's settings
+  file and decodes the cached plugin list again. KOReader starts a new copy
+  of every plugin each time it switches between the file browser and a book,
+  and Plugin Manager's start was the most expensive of all (about 230 KB
+  read and decoded, twice per book). The settings and the decoded list are
+  now kept once and shared. No memory leak was found: opening and closing
+  Plugin Manager or a book 40-120 times in a row leaves memory flat.
+- Uses less memory: most of Plugin Manager, and the cached plugin list,
+  load the first time you use it, not when KOReader starts (about 870 KB
+  less at startup in English). Only the translations of your language are
+  loaded, none in English.
+
+## [1.7.1] - 2026-11-04
+
+### Fixed – translations
+- The search dialogs' "Clear" button uses its own English key ("Clear
+  search", still "Effacer" in French). It shared "Clear" with the game
+  plugins, which translate it "Effacer tout".
+- German category names now match the Tools → Games menu: "Gruppenspiele"
+  (was "Party & Quiz") and "Andere" (was "Sonstige").
+- "All categories" reads "Toutes catégories" in French, as in Pictionary
+  (was "Toutes les catégories"; both shared one entry).
 
 ## [1.7.0] - 2026-11-03
 

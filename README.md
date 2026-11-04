@@ -259,7 +259,7 @@ Use a **classic** token (Settings → Developer settings → Personal access tok
 
 ## Localization
 
-English is the plugin's source language and needs no translation file: whenever KOReader's UI language isn't French, every string falls straight through to its original English text via `i18n.lua`'s gettext fallback. French translations live in `i18n_fr.lua`, a flat table of `{ ["English source string"] = { fr = "..." } }` entries, merged in at startup. To add another language, add a matching `i18n_<code>.lua` file and load it the same way `i18n_fr.lua` is loaded in `main.lua`.
+English is the plugin's source language and needs no translation file: whenever KOReader's UI language isn't French, every string falls straight through to its original English text via `i18n.lua`'s gettext fallback. Translations live in `i18n_fr.lua`, a flat table of `{ ["English source string"] = { fr = "...", es = "...", de = "..." } }` entries. `i18n.lua` reads it on the first string translated into the UI language and keeps only that language's strings (English never loads it). To add another language, add its code to each entry.
 
 ## License
 
