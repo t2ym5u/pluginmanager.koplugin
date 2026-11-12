@@ -250,6 +250,7 @@ return {
     ["Card & dice games"]        = { fr = "Cartes et dés", es = "Cartas y dados", de = "Karten- und Würfelspiele" },
     ["Classic puzzles"]          = { fr = "Casse-têtes classiques", es = "Rompecabezas clásicos", de = "Klassische Rätsel" },
     ["Party & quiz"]             = { fr = "Jeux de groupe", es = "Juegos de grupo", de = "Gruppenspiele" },
+    ["Two readers"]              = { fr = "À deux liseuses", es = "Con dos lectores", de = "Mit zwei Readern" },
     ["Utilities"]                = { fr = "Utilitaires", es = "Utilidades", de = "Werkzeuge" },
     ["Other"]                    = { fr = "Autres", es = "Otros", de = "Andere" },
     ["All categories"]           = { fr = "Toutes catégories", es = "Todas las categorías", de = "Alle Kategorien" },

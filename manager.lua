@@ -3080,6 +3080,7 @@ local function category_label(id)
         cards   = _("Card & dice games"),
         classic = _("Classic puzzles"),
         party   = _("Party & quiz"),
+        duo     = _("Two readers"),
         tools   = _("Utilities"),
     }
     return labels[id] or _("Other")

@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.4] - 2026-11-10
+
+### Added
+- The "Two readers" category (FR « À deux liseuses ») in the catalogue's
+  category filter, for the new games played with two readers.
+
 ## [1.7.3] - 2026-11-04
 
 ### Fixed

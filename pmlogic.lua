@@ -208,7 +208,7 @@ end
 
 -- Ids are stable (see .github/scripts/categories.json); labels live in
 -- main.lua so they go through the translation table.
-L.CATEGORY_ORDER = { "logic", "sudoku", "words", "board", "cards", "classic", "party", "tools" }
+L.CATEGORY_ORDER = { "logic", "sudoku", "words", "board", "cards", "classic", "party", "duo", "tools" }
 
 -- Splits `items` (each with an optional `category`) into sections in
 -- CATEGORY_ORDER, then "other" for anything without a category or with one
