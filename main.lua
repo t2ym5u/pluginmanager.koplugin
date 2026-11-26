@@ -248,6 +248,8 @@ local MANAGER_METHODS = {
     "homeEntries",
     "showMainDialog",
     "refreshHome",
+    "maintenanceEntries",
+    "showMaintenanceMenu",
     "exportInstalled",
     "confirmImport",
     "_runImport",
@@ -306,6 +308,14 @@ function PluginManager:init()
         end
     end
 end
+
+-- KOReader broadcasts these when Wi-Fi comes up or goes down, whoever turned
+-- it on or off. The home screen's "Wi-Fi on/off" line follows them. Nothing to
+-- do (and nothing to load) unless that screen is open.
+function PluginManager:onNetworkConnected()
+    if _manager_loaded and self._home_menu then self:refreshHome() end
+end
+PluginManager.onNetworkDisconnected = PluginManager.onNetworkConnected
 
 function PluginManager:addToMainMenu(menu_items)
     menu_items.pluginmanager = {

@@ -48,6 +48,38 @@ local function safe_call(fn, ...)
     return a, b
 end
 
+-- Every list is a full-screen Menu. Left to its defaults, Menu is a
+-- "popout": a bordered frame with rounded corners (radius = width / 20) and
+-- a tap outside it closes the menu. Full screen, that leaves white wedges in
+-- the corners, so the lists are drawn flat and borderless, like Dashboard's.
+-- A list that fits on one page also drops the "Page 1 of 1" bar and its
+-- greyed-out arrows: nothing in it can be used. updatePageInfo already runs
+-- inside Menu:init, hence a subclass rather than a patch on the instance.
+local FlatMenu
+local function full_screen_menu(args)
+    if not FlatMenu then
+        local Menu = require("ui/widget/menu")
+        FlatMenu = Menu:extend{}
+        function FlatMenu:updatePageInfo(select_number)
+            Menu.updatePageInfo(self, select_number)
+            if #self.item_table > 0 and (self.page_num or 1) <= 1 then
+                self.page_info_text:setText("")
+                self.page_info_left_chev:hide()
+                self.page_info_right_chev:hide()
+                self.page_info_first_chev:hide()
+                self.page_info_last_chev:hide()
+            end
+        end
+    end
+    local Screen = require("device").screen
+    args.width             = Screen:getWidth()
+    args.height            = Screen:getHeight()
+    args.is_borderless     = true
+    args.is_popout         = false
+    args.covers_fullscreen = true
+    return FlatMenu:new(args)
+end
+
 -- ---------------------------------------------------------------------------
 -- Disable / enable installed plugins without deleting them
 -- ---------------------------------------------------------------------------
@@ -2046,8 +2078,6 @@ function PluginManager:_showDiscoverDialog(page, accumulated, link_target)
             return
         end
 
-        local Menu   = require("ui/widget/menu")
-        local Screen = require("device").screen
 
         -- Cross-reference each result against what's on disk under the
         -- folder name a plain single-repo install would use (same fallback
@@ -2118,14 +2148,12 @@ function PluginManager:_showDiscoverDialog(page, accumulated, link_target)
             end
 
             local menu_instance
-            menu_instance = Menu:new{
+            menu_instance = full_screen_menu{
                 title               = link_target
                     and string.format(_("Select repo for %s"), link_target.fullname)
                     or  _("Discover plugins"),
                 subtitle            = self._discover_filter and string.format(_("Search: %s"), self._discover_filter) or nil,
                 item_table          = items,
-                width               = Screen:getWidth(),
-                height              = Screen:getHeight(),
                 title_bar_left_icon = "appbar.search",
                 onLeftButtonTap     = function()
                     UIManager:close(menu_instance)
@@ -3184,8 +3212,6 @@ end
 -- name filter and category filter narrow it first. Offline -- no manifest
 -- cached yet -- there are no categories to go by and the list stays flat.
 function PluginManager:showPluginList()
-    local Menu   = require("ui/widget/menu")
-    local Screen = require("device").screen
 
     local installed = self:scanInstalled()
     local items     = {}
@@ -3332,12 +3358,10 @@ function PluginManager:showPluginList()
     if filter ~= "" then subtitle_parts[#subtitle_parts + 1] = string.format(_("Filter: %s"), self._list_filter) end
 
     local menu_instance
-    menu_instance = Menu:new{
+    menu_instance = full_screen_menu{
         title               = _("Plugins"),
         subtitle            = #subtitle_parts > 0 and table.concat(subtitle_parts, " \u{00B7} ") or nil,
         item_table          = items,
-        width               = Screen:getWidth(),
-        height              = Screen:getHeight(),
         title_bar_left_icon = "appbar.search",
         onLeftButtonTap     = function()
             UIManager:close(menu_instance)
@@ -4491,8 +4515,6 @@ function PluginManager:showPatchRepoDialog(repo)
             return
         end
 
-        local Menu      = require("ui/widget/menu")
-        local Screen    = require("device").screen
         local installed = self:scanInstalledPatches()
 
         local menu_items = {}
@@ -4523,12 +4545,10 @@ function PluginManager:showPatchRepoDialog(repo)
         end
 
         local menu_instance
-        menu_instance = Menu:new{
+        menu_instance = full_screen_menu{
             title      = repo.full_name,
             subtitle   = json_str(repo.description) ~= "" and repo.description or nil,
             item_table = menu_items,
-            width      = Screen:getWidth(),
-            height     = Screen:getHeight(),
         }
         function menu_instance:onMenuChoice(item)
             UIManager:close(self)
@@ -4600,8 +4620,6 @@ function PluginManager:_showDiscoverPatchesDialog(page, accumulated)
             return
         end
 
-        local Menu   = require("ui/widget/menu")
-        local Screen = require("device").screen
 
         local items = {}
         for _i, repo in ipairs(accumulated) do
@@ -4620,12 +4638,10 @@ function PluginManager:_showDiscoverPatchesDialog(page, accumulated)
         end
 
         local menu_instance
-        menu_instance = Menu:new{
+        menu_instance = full_screen_menu{
             title               = _("Discover patches"),
             subtitle            = self._discover_patches_filter and string.format(_("Search: %s"), self._discover_patches_filter) or nil,
             item_table          = items,
-            width               = Screen:getWidth(),
-            height              = Screen:getHeight(),
             title_bar_left_icon = "appbar.search",
             onLeftButtonTap     = function()
                 UIManager:close(menu_instance)
@@ -4737,8 +4753,6 @@ function PluginManager:showInstalledPatchDialog(iref)
 end
 
 function PluginManager:showInstalledPatchesList()
-    local Menu      = require("ui/widget/menu")
-    local Screen    = require("device").screen
     local installed = self:scanInstalledPatches()
 
     local items = {}
@@ -4760,11 +4774,9 @@ function PluginManager:showInstalledPatchesList()
     table.sort(items, function(a, b) return a.text < b.text end)
 
     local menu_instance
-    menu_instance = Menu:new{
+    menu_instance = full_screen_menu{
         title      = _("Installed patches"),
         item_table = items,
-        width      = Screen:getWidth(),
-        height     = Screen:getHeight(),
     }
     function menu_instance:onMenuChoice(item)
         UIManager:close(self)
@@ -4814,7 +4826,8 @@ end
 -- Main dialog
 -- ---------------------------------------------------------------------------
 
--- ✓/✗ Wi-Fi radio state, refreshed every time the main dialog is (re)opened.
+-- ✓/✗ Wi-Fi radio state, refreshed when the main dialog opens and whenever
+-- KOReader reports the network going up or down (refreshHome).
 -- isWifiOn() (as opposed to isConnected()) reflects the radio switch itself,
 -- which is what a user checking "is Wi-Fi on" actually wants to know. On
 -- devices without a Wi-Fi toggle it always returns true, so the line always
@@ -4842,17 +4855,13 @@ local function screen_menu_items(entries)
 end
 
 function PluginManager:showScreenMenu(title, subtitle, entries, rebuild)
-    local Menu   = require("ui/widget/menu")
-    local Screen = require("device").screen
 
     local items = screen_menu_items(entries)
 
-    local menu_instance = Menu:new{
+    local menu_instance = full_screen_menu{
         title      = title,
         subtitle   = subtitle,
         item_table = items,
-        width      = Screen:getWidth(),
-        height     = Screen:getHeight(),
     }
     function menu_instance:onMenuChoice(item)
         local entry = item.entry
@@ -4878,9 +4887,31 @@ function PluginManager:updateEntryText()
     return _("Update")
 end
 
+-- Everyday actions first; the rare bulk ones (two of them destructive) sit
+-- one level down, under Maintenance, away from a mis-tap on Update.
 function PluginManager:homeEntries()
     local entries = {
-        { text = self:updateEntryText(), callback = function() self:doFullUpdate() end },
+        { text = self:updateEntryText(),             callback = function() self:doFullUpdate() end },
+        { text = _("Plugin list"),                   callback = function() self:showPluginList() end },
+        { text = _("Discover plugins\u{2026}"),       callback = function() self:showDiscoverDialog() end },
+        { text = _("Patches\u{2026}"),                callback = function() self:showPatchesMainDialog() end },
+        { text = _("Ignored updates\u{2026}"),        callback = function() self:showIgnoredDialog() end },
+        { text = _("Maintenance\u{2026}"),            callback = function() self:showMaintenanceMenu() end },
+    }
+    -- Retired plugins / templates still on the device: offered first, and
+    -- only while there are some (PluginManager:scanUnwanted).
+    local unwanted = self:scanUnwanted()
+    if #unwanted > 0 then
+        table.insert(entries, 1, {
+            text     = string.format(_("Remove outdated plugins (%d)\u{2026}"), #unwanted),
+            callback = function() self:showUnwantedDialog() end,
+        })
+    end
+    return entries
+end
+
+function PluginManager:maintenanceEntries()
+    return {
         { text = _("Install everything\u{2026}"), callback = function() self:doInstallEverything() end },
         {
             text     = _("Reinstall all\u{2026}"),
@@ -4902,23 +4933,13 @@ function PluginManager:homeEntries()
                 })
             end,
         },
-        { text = _("Plugin list"),                   callback = function() self:showPluginList() end },
-        { text = _("Discover plugins\u{2026}"),       callback = function() self:showDiscoverDialog() end },
-        { text = _("Patches\u{2026}"),                callback = function() self:showPatchesMainDialog() end },
-        { text = _("Ignored updates\u{2026}"),        callback = function() self:showIgnoredDialog() end },
         { text = _("Export installed list"),           callback = function() self:exportInstalled() end },
         { text = _("Import list\u{2026}"),             callback = function() self:confirmImport() end },
     }
-    -- Retired plugins / templates still on the device: offered first, and
-    -- only while there are some (PluginManager:scanUnwanted).
-    local unwanted = self:scanUnwanted()
-    if #unwanted > 0 then
-        table.insert(entries, 1, {
-            text     = string.format(_("Remove outdated plugins (%d)\u{2026}"), #unwanted),
-            callback = function() self:showUnwantedDialog() end,
-        })
-    end
-    return entries
+end
+
+function PluginManager:showMaintenanceMenu()
+    self:showScreenMenu(_("Maintenance"), nil, self:maintenanceEntries())
 end
 
 function PluginManager:showMainDialog()
@@ -4930,17 +4951,33 @@ function PluginManager:showMainDialog()
     local orig_close = menu.onCloseWidget
     function menu:onCloseWidget()
         if pm._home_menu == self then pm._home_menu = nil end
+        -- Leaving Plugin Manager ends its network session: if one of its
+        -- actions turned Wi-Fi on (runWhenOnline -> beforeWifiAction),
+        -- KOReader now applies the user's "Action when done with Wi-Fi"
+        -- setting (prompt by default, turn off, or leave on). It does nothing
+        -- when Wi-Fi was already on. On the next tick, so a quit or restart
+        -- in progress never gets a prompt.
+        UIManager:nextTick(function()
+            local ok, NetworkMgr = pcall(require, "ui/network/manager")
+            if ok and NetworkMgr and NetworkMgr.afterWifiAction then
+                pcall(NetworkMgr.afterWifiAction, NetworkMgr)
+            end
+        end)
         if orig_close then return orig_close(self) end
     end
 end
 
--- Recounts updates on the home screen, if it is open. Cheap -- cached
--- manifest plus a local scan -- and silent on any error: a stale label must
--- never break the action that triggered the refresh.
+-- Recounts updates on the home screen, if it is open, and re-reads the
+-- Wi-Fi line under its title (it is also called on NetworkConnected and
+-- NetworkDisconnected, see main.lua). Cheap -- cached manifest plus a local
+-- scan -- and silent on any error: a stale label must never break the action
+-- that triggered the refresh.
 function PluginManager:refreshHome()
     local menu = self._home_menu
     if not menu then return end
     pcall(function()
+        local status = self:wifiStatusLine()
+        if status and menu.title_bar then menu.title_bar:setSubTitle(status, true) end
         menu:switchItemTable(nil, screen_menu_items(self:homeEntries()), -1)
     end)
 end

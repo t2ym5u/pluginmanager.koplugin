@@ -47,7 +47,7 @@ Open **Tools → Plugin Manager**.
 | Action | How |
 |--------|-----|
 | Load/refresh the plugin catalogue and update everything outdated | Tap **Update** |
-| Install every plugin *and* the repository's patches in one go | Tap **Install everything…** (see below) |
+| Install every plugin *and* the repository's patches in one go | **Maintenance… → Install everything…** (see below) |
 | Browse every plugin (installed and available) | Tap **Plugin list** |
 | Install a new plugin | In the plugin list, tap a plugin in the *Available* section → **Install** |
 | Update a single plugin | Tap a plugin showing `v1.0 → v1.1` → **Update to v1.1** |
@@ -65,7 +65,10 @@ Open **Tools → Plugin Manager**.
 | See what an update changes | Tap a plugin showing `v1.0 → v1.1` → **What's new** |
 | Show one category only | Tap the magnifier → **Category: …** |
 | Undo the last update of a plugin | Tap it → **Restore previous version (vX)** |
-| Copy your plugin set to another reader | **Export installed list** here, copy the file, **Import list…** there |
+| Copy your plugin set to another reader | **Maintenance… → Export installed list** here, copy the file, **Maintenance… → Import list…** there |
+| Reinstall or remove every plugin at once | **Maintenance… → Reinstall all…** / **Remove all…** |
+
+The line under the title shows whether Wi-Fi is on and follows it while the screen is open. When you leave Plugin Manager after it turned Wi-Fi on, KOReader does what its **Action when done with Wi-Fi** setting says (ask, turn off, or leave on).
 
 After installing, updating, removing, or (de)disabling a plugin, **restart KOReader** for the change to take effect. Plugin Manager offers to do it for you (*Restart now*); on a device that cannot restart itself it says so instead.
 
@@ -201,7 +204,7 @@ of this plugin manages `.koplugin` plugins, and the same feature
 
 ## Install everything
 
-**Install everything…** on the home screen does in one run what **Update**
+**Install everything…** (home screen → **Maintenance…**) does in one run what **Update**
 and **Patches → Install all N patches…** do separately:
 
 1. It fetches the plugin list and works out what **Update** would do — every

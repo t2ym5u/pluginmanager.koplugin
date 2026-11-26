@@ -260,6 +260,8 @@ return {
 
     -- Home screen, export / import
     ["Update (%d)"]              = { fr = "Mettre à jour (%d)", es = "Actualizar (%d)", de = "Aktualisieren (%d)" },
+    ["Maintenance\u{2026}"]       = { fr = "Maintenance…", es = "Mantenimiento…", de = "Wartung…" },
+    ["Maintenance"]              = { fr = "Maintenance", es = "Mantenimiento", de = "Wartung" },
     ["Export installed list"]    = { fr = "Exporter la liste installée", es = "Exportar la lista instalada", de = "Installierte Liste exportieren" },
     ["Import list\u{2026}"]      = { fr = "Importer une liste…", es = "Importar una lista…", de = "Liste importieren…" },
     ["Press Update once first: the export needs the plugin list."] = { fr = "Appuyez d'abord une fois sur Mettre à jour : l'export a besoin de la liste des plugins.", es = "Pulse primero Actualizar una vez: la exportación necesita la lista de plugins.", de = "Tippen Sie zuerst einmal auf Aktualisieren: Der Export benötigt die Plugin-Liste." },

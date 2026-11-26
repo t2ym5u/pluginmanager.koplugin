@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.5] - 2026-11-26
+
+### Fixed
+- The "Wi-Fi on/off" line under the home screen's title kept the state it had
+  when the screen opened: after Update turned Wi-Fi on, it still read "Wi-Fi
+  off". It now follows Wi-Fi going up or down while the screen is open.
+- Plugin Manager left Wi-Fi on after its downloads. Leaving its home screen
+  now applies KOReader's "Action when done with Wi-Fi" setting (ask, turn
+  off, or leave on) when Plugin Manager turned Wi-Fi on itself.
+
+### Changed
+- Every list is drawn flat and full screen, without the rounded frame and
+  border it had.
+- A list that fits on one page no longer shows the "Page 1 of 1" bar.
+- Home screen: Update, Plugin list, Discover plugins, Patches and Ignored
+  updates first; Install everything, Reinstall all, Remove all, Export and
+  Import moved to a new Maintenance… screen.
+
 ## [1.7.4] - 2026-11-10
 
 ### Added
