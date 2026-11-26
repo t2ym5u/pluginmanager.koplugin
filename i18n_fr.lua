@@ -1,4 +1,6 @@
 return {
+    -- _meta.lua description (shown by Plugin Manager, via the manifest)
+    ["Check for updates and install game plugins from the koreader-plugins repository."] = { fr = "Vérifie les mises à jour et installe les plugins de jeux du dépôt koreader-plugins.", es = "Busca actualizaciones e instala los plugins de juegos del repositorio koreader-plugins.", de = "Sucht nach Updates und installiert Spiele-Plugins aus dem Repository koreader-plugins." },
     ["ssl.https not available"]  = { fr = "ssl.https non disponible", es = "ssl.https no disponible", de = "ssl.https nicht verfügbar" },
     ["ltn12 not available"]      = { fr = "ltn12 non disponible", es = "ltn12 no disponible", de = "ltn12 nicht verfügbar" },
     ["HTTP %s"]                  = { fr = "HTTP %s", es = "HTTP %s", de = "HTTP %s" },
