@@ -460,6 +460,16 @@ local function json_str(v)
     return type(v) == "string" and v or ""
 end
 
+-- A catalogue plugin's description in the reader's language: the manifest's
+-- description_i18n (copied from the plugin's own i18n_fr.lua by
+-- update_manifest.py) when it has that language, else the English one.
+local function plugin_description(plugin_info)
+    local tr = type(plugin_info.description_i18n) == "table"
+        and plugin_info.description_i18n[_.lang()]
+    if type(tr) == "string" and tr ~= "" then return tr end
+    return json_str(plugin_info.description)
+end
+
 local function json_num(v)
     return type(v) == "number" and v or 0
 end
@@ -2702,6 +2712,7 @@ function PluginManager:showInstalledDialog(plugin_info, inst_info, has_update)
             callback = function()
                 UIManager:close(dlg)
                 set_plugin_disabled(pid, not iref.disabled)
+                self:refreshPluginList()
                 self:askRestart(iref.disabled
                     and string.format(_("%s enabled.\nRestart KOReader to apply."), iref.fullname)
                     or  string.format(_("%s disabled.\nRestart KOReader to apply."), iref.fullname))
@@ -2737,8 +2748,8 @@ function PluginManager:showInstalledDialog(plugin_info, inst_info, has_update)
     if has_update then
         title = title .. "  \u{2192}  v" .. plugin_info.version
     end
-    if json_str(plugin_info.description) ~= "" then
-        title = title .. "\n" .. json_str(plugin_info.description)
+    if plugin_description(plugin_info) ~= "" then
+        title = title .. "\n" .. plugin_description(plugin_info)
     end
     if not self:isCompatible(plugin_info) then
         title = title .. "\n" .. string.format(_("v%s needs KOReader %s or newer."), plugin_info.version, plugin_info.min_koreader)
@@ -2751,8 +2762,8 @@ end
 function PluginManager:showAvailableDialog(plugin_info)
     local dlg
     local title = plugin_info.fullname .. "  v" .. plugin_info.version
-    if json_str(plugin_info.description) ~= "" then
-        title = title .. "\n" .. json_str(plugin_info.description)
+    if plugin_description(plugin_info) ~= "" then
+        title = title .. "\n" .. plugin_description(plugin_info)
     end
     if not self:isCompatible(plugin_info) then
         title = title .. "\n" .. string.format(_("Needs KOReader %s or newer."), plugin_info.min_koreader)
@@ -3206,12 +3217,11 @@ function PluginManager:showPluginListFilterDialog()
     input:onShowKeyboard()
 end
 
--- The list is split into one section per category (manifest field
--- `category`), each opened by a non-selectable header row; the sort mode
--- (name, or status with updates first) applies inside each section, and the
--- name filter and category filter narrow it first. Offline -- no manifest
--- cached yet -- there are no categories to go by and the list stays flat.
-function PluginManager:showPluginList()
+-- One row per plugin: { text, mandatory, category, _sort_group, callback },
+-- narrowed by the name and category filters and sorted by the sort mode.
+-- Offline -- no manifest cached yet -- only the installed plugins, and nil
+-- when there are none.
+function PluginManager:_pluginListItems()
 
     local installed = self:scanInstalled()
     local items     = {}
@@ -3227,13 +3237,7 @@ function PluginManager:showPluginList()
                 callback    = function() self:showLocalOnlyDialog(iref) end,
             }
         end
-        if #items == 0 then
-            UIManager:show(InfoMessage:new{
-                text    = _("No plugins installed.\nPress Update to fetch the list."),
-                timeout = 3,
-            })
-            return
-        end
+        if #items == 0 then return nil end
     else
         local known_ids = {}
         for _i, p in ipairs(self:getManifest().plugins) do
@@ -3332,36 +3336,109 @@ function PluginManager:showPluginList()
         table.sort(items, function(a, b) return a.text < b.text end)
     end
 
-    -- Sections. Not when the list is narrowed to one category (the subtitle
-    -- already names it), offline, or with a manifest from before categories
-    -- existed (nothing to group by: one "Other" header over everything).
+    return items
+end
+
+-- How the list is shown. With categories in the manifest and no filter, it
+-- opens on an overview: one row per category (and one for the pending
+-- updates, first), each opening its plugins in the same screen; the close
+-- button there comes back to the overview (Menu's sub_item_table). A
+-- filtered list -- by name or by category, from the magnifier -- is flat, with
+-- section headers when the name filter spans several categories. Offline, or
+-- with a manifest from before categories, it is flat too.
+-- Returns rows, subtitle (plugin count, filters, pending updates).
+function PluginManager:_pluginListView(items)
+    local filter = self._list_filter or ""
     local has_categories = false
     for _i, p in ipairs(self:getManifest() and self:getManifest().plugins or {}) do
         if json_str(p.category) ~= "" then has_categories = true break end
     end
-    if has_categories and not self._list_category then
-        local grouped = {}
-        for _i, group in ipairs(PMLogic.groupByCategory(items)) do
-            grouped[#grouped + 1] = {
-                text           = "\u{25B8} " .. category_label(group.id),
+
+    local function count_updates(list)
+        local n = 0
+        for _i, item in ipairs(list) do
+            if item._sort_group == SORT_GROUP_UPDATE then n = n + 1 end
+        end
+        return n
+    end
+    local updates = count_updates(items)
+    local subtitle_parts = { string.format(_("%d plugin(s)"), #items) }
+    if self._list_category then subtitle_parts[#subtitle_parts + 1] = category_label(self._list_category) end
+    if filter ~= "" then subtitle_parts[#subtitle_parts + 1] = string.format(_("Filter: %s"), filter) end
+    if updates > 0 then
+        subtitle_parts[#subtitle_parts + 1] = string.format(_("%d update(s) available"), updates)
+    end
+    local subtitle = table.concat(subtitle_parts, " \u{00B7} ")
+
+    if not has_categories or self._list_category then return items, subtitle end
+
+    local groups = PMLogic.groupByCategory(items)
+    if filter ~= "" then
+        local rows = {}
+        for _i, group in ipairs(groups) do
+            rows[#rows + 1] = {
+                text           = category_label(group.id),
                 mandatory      = tostring(#group.items),
                 bold           = true,
                 select_enabled = false,
             }
-            for _j, item in ipairs(group.items) do grouped[#grouped + 1] = item end
+            for _j, item in ipairs(group.items) do rows[#rows + 1] = item end
         end
-        items = grouped
+        return rows, subtitle
     end
 
-    local subtitle_parts = {}
-    if self._list_category then subtitle_parts[#subtitle_parts + 1] = category_label(self._list_category) end
-    if filter ~= "" then subtitle_parts[#subtitle_parts + 1] = string.format(_("Filter: %s"), self._list_filter) end
+    local rows = {}
+    if updates > 0 then
+        local pending = {}
+        for _i, item in ipairs(items) do
+            if item._sort_group == SORT_GROUP_UPDATE then pending[#pending + 1] = item end
+        end
+        rows[#rows + 1] = {
+            text           = _("Updates available"),
+            mandatory      = tostring(updates),
+            bold           = true,
+            _group         = "updates",
+            sub_item_table = pending,
+        }
+    end
+    for _i, group in ipairs(groups) do
+        local u = count_updates(group.items)
+        rows[#rows + 1] = {
+            text           = category_label(group.id),
+            mandatory      = u > 0
+                and string.format(_("%d to update \u{00B7} %d"), u, #group.items)
+                or  tostring(#group.items),
+            _group         = group.id,
+            sub_item_table = group.items,
+        }
+    end
+    return rows, subtitle
+end
 
+-- Rows of the overview that open a group, by group id.
+local function find_group_row(rows, id)
+    for _i, row in ipairs(rows) do
+        if row._group == id and row.sub_item_table then return row end
+    end
+end
+
+function PluginManager:showPluginList()
+    local items = self:_pluginListItems()
+    if not items then
+        UIManager:show(InfoMessage:new{
+            text    = _("No plugins installed.\nPress Update to fetch the list."),
+            timeout = 3,
+        })
+        return
+    end
+    local rows, subtitle = self:_pluginListView(items)
+
+    local pm = self
     local menu_instance
     menu_instance = full_screen_menu{
         title               = _("Plugins"),
-        subtitle            = #subtitle_parts > 0 and table.concat(subtitle_parts, " \u{00B7} ") or nil,
-        item_table          = items,
+        subtitle            = subtitle,
+        item_table          = rows,
         title_bar_left_icon = "appbar.search",
         onLeftButtonTap     = function()
             UIManager:close(menu_instance)
@@ -3379,12 +3456,59 @@ function PluginManager:showPluginList()
             self:showPluginList()
         end,
     }
-    function menu_instance:onMenuChoice(item)
-        if not item.callback then return end  -- a section header
-        UIManager:close(self)
-        item.callback()
+    -- The open group (category, or "updates"), so a refresh after an
+    -- install stays in it.
+    local orig_select = menu_instance.onMenuSelect
+    function menu_instance:onMenuSelect(item)
+        if item.sub_item_table then self._group = item._group end
+        return orig_select(self, item)
     end
+    local orig_close = menu_instance.onClose
+    function menu_instance:onClose()
+        if #self.item_table_stack > 0 then self._group = nil end
+        return orig_close(self)
+    end
+    -- A plugin's dialog opens over the list, which stays where it was;
+    -- whatever the dialog changes, refreshPluginList redraws in place.
+    function menu_instance:onMenuChoice(item)
+        if item.callback then item.callback() end
+    end
+    local orig_close_widget = menu_instance.onCloseWidget
+    function menu_instance:onCloseWidget()
+        if pm._list_menu == self then pm._list_menu = nil end
+        if orig_close_widget then return orig_close_widget(self) end
+    end
+    self._list_menu = menu_instance
     UIManager:show(menu_instance)
+end
+
+-- Rebuilds the open plugin list in place (versions, updates, installed or
+-- not) after an install, update, removal, ignore or (de)activation, staying
+-- in the open group and on the same page. Silent on any error, like
+-- refreshHome.
+function PluginManager:refreshPluginList()
+    local menu = self._list_menu
+    if not menu then return end
+    pcall(function()
+        local items = self:_pluginListItems() or {}
+        local rows, subtitle = self:_pluginListView(items)
+        if menu.title_bar then menu.title_bar:setSubTitle(subtitle, true) end
+        local row = menu._group and find_group_row(rows, menu._group)
+        local title, list = nil, rows
+        if row then
+            rows.title = menu.item_table_stack[1] and menu.item_table_stack[1].title or _("Plugins")
+            menu.item_table_stack = { rows }
+            title, list = row.text, row.sub_item_table
+        else
+            menu.item_table_stack = {}
+            menu._group = nil
+            title = _("Plugins")
+        end
+        local per = menu.perpage or 1
+        local last = math.max(1, math.ceil(#list / per))
+        if (menu.page or 1) > last then menu.page = last end
+        menu:switchItemTable(title, list, -1)
+    end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -3589,6 +3713,7 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
             text    = table.concat(parts, "\n"),
             timeout = 4,
         })
+        if opts.release_wifi then self:releaseWifi() end
     end
 
     -- `done`: how many plugins were attempted.
@@ -3617,6 +3742,7 @@ function PluginManager:_runBulkInstall(manifest, to_process, opts)
         self:refreshHome()
         if opts.on_done then return opts.on_done(parts, succeeded, has_self, stopped) end
         self:_showSummary(parts, succeeded > 0, has_self)
+        if opts.release_wifi then self:releaseWifi() end
     end
 
     local function step(i)
@@ -3763,7 +3889,12 @@ function PluginManager:_doFullUpdate()
 
         local plan = self:_planFullUpdate(manifest)
         self:_refreshDiscoverLinkedVersions(plan.installed, function()
-            self:_runBulkInstall(manifest, plan.to_process, { skipped = plan.skipped })
+            -- Started without the home screen (Dashboard's "Update plugins"):
+            -- no screen will close to give Wi-Fi back, so the run does it.
+            self:_runBulkInstall(manifest, plan.to_process, {
+                skipped      = plan.skipped,
+                release_wifi = not self._home_menu,
+            })
         end)
     end)
 end
@@ -4938,6 +5069,21 @@ function PluginManager:maintenanceEntries()
     }
 end
 
+-- Ends a network session: if one of Plugin Manager's actions turned Wi-Fi
+-- on (runWhenOnline -> beforeWifiAction), KOReader now applies the user's
+-- "Action when done with Wi-Fi" setting (prompt by default, turn off, or
+-- leave on). It does nothing when Wi-Fi was already on. On the next tick, so
+-- a quit or restart in progress never gets a prompt. Called when the home
+-- screen closes, and after an Update started from elsewhere (Dashboard).
+function PluginManager:releaseWifi()
+    UIManager:nextTick(function()
+        local ok, NetworkMgr = pcall(require, "ui/network/manager")
+        if ok and NetworkMgr and NetworkMgr.afterWifiAction then
+            pcall(NetworkMgr.afterWifiAction, NetworkMgr)
+        end
+    end)
+end
+
 function PluginManager:showMaintenanceMenu()
     self:showScreenMenu(_("Maintenance"), nil, self:maintenanceEntries())
 end
@@ -4951,18 +5097,8 @@ function PluginManager:showMainDialog()
     local orig_close = menu.onCloseWidget
     function menu:onCloseWidget()
         if pm._home_menu == self then pm._home_menu = nil end
-        -- Leaving Plugin Manager ends its network session: if one of its
-        -- actions turned Wi-Fi on (runWhenOnline -> beforeWifiAction),
-        -- KOReader now applies the user's "Action when done with Wi-Fi"
-        -- setting (prompt by default, turn off, or leave on). It does nothing
-        -- when Wi-Fi was already on. On the next tick, so a quit or restart
-        -- in progress never gets a prompt.
-        UIManager:nextTick(function()
-            local ok, NetworkMgr = pcall(require, "ui/network/manager")
-            if ok and NetworkMgr and NetworkMgr.afterWifiAction then
-                pcall(NetworkMgr.afterWifiAction, NetworkMgr)
-            end
-        end)
+        -- Leaving Plugin Manager ends its network session.
+        pm:releaseWifi()
         if orig_close then return orig_close(self) end
     end
 end
@@ -4973,6 +5109,7 @@ end
 -- scan -- and silent on any error: a stale label must never break the action
 -- that triggered the refresh.
 function PluginManager:refreshHome()
+    self:refreshPluginList()
     local menu = self._home_menu
     if not menu then return end
     pcall(function()

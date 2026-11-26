@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.6] - 2026-11-26
+
+### Changed
+- The plugin list opens on its categories, one row each with its plugin
+  count and how many have an update, and an "Updates available" row first
+  when there are some: one page instead of ten. Tap a row for its plugins;
+  the close button comes back to the categories. A search still gives a flat
+  list.
+- A plugin's dialog opens over the list instead of closing it: you come back
+  to the same category and page, and the list shows what an install,
+  update, removal or (de)activation changed.
+- Plugin descriptions are shown in the reader's language (French, Spanish,
+  German) when the plugin has a translation, instead of always in English.
+
+### Fixed
+- "Update plugins" from Dashboard left Wi-Fi on: it now hands Wi-Fi back to
+  KOReader's "Action when done with Wi-Fi" setting once the update is done.
+
 ## [1.7.5] - 2026-11-26
 
 ### Fixed

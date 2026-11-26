@@ -123,3 +123,120 @@ describe("Plugin Manager home screen", function()
     assert.is_nil(pm._home_menu)
   end)
 end)
+
+-- ---------------------------------------------------------------------------
+-- The plugin list
+-- ---------------------------------------------------------------------------
+
+local function write(path, text)
+  os.execute(("mkdir -p %q"):format(path:match("^(.*)/[^/]+$")))
+  local f = assert(io.open(path, "w")); f:write(text); f:close()
+end
+
+-- Installs fake plugins on the sandbox device and gives Plugin Manager a
+-- manifest: bridges (logic) and wordle (words) have an update, netwalk
+-- (logic) is up to date, chess (board) is not installed.
+local function with_catalogue(pm)
+  for id, v in pairs({ bridges = "1.0", netwalk = "1.0", wordle = "1.0" }) do
+    write(PLUGINS .. "/" .. id .. ".koplugin/_meta.lua",
+      ('return { fullname = "%s", version = "%s" }\n'):format(id, v))
+  end
+  pm._manifest = { plugins = {
+    { id = "bridges", fullname = "bridges", version = "1.1", category = "logic",
+      description = "Connect the islands.",
+      description_i18n = { fr = "Reliez les îles.", es = "Conecta las islas.", de = "Verbinde die Inseln." } },
+    { id = "netwalk", fullname = "netwalk", version = "1.0", category = "logic" },
+    { id = "wordle",  fullname = "wordle",  version = "1.1", category = "words" },
+    { id = "chess",   fullname = "chess",   version = "1.0", category = "board" },
+  } }
+end
+
+local function find(rows, text)
+  for _i, row in ipairs(rows) do if row.text == text then return row end end
+end
+
+describe("Plugin Manager plugin list", function()
+  it("opens on the categories, with the pending updates first", function()
+    local pm = load_pm()
+    with_catalogue(pm)
+    pm:showPluginList()
+    local m = menus[#menus]
+    local rows = m.item_table
+    assert.are.equal(tr("Updates available"), rows[1].text)
+    assert.are.equal("2", rows[1].mandatory)
+    assert.are.equal(2, #rows[1].sub_item_table)
+    local logic = rows[2]
+    assert.are.equal("logic", logic._group)
+    assert.are.equal(string.format(tr("%d to update \u{00B7} %d"), 1, 2), logic.mandatory)
+    assert.are.equal(2, #logic.sub_item_table)
+    assert.is_truthy(m.subtitle:find(string.format(tr("%d update(s) available"), 2), 1, true))
+  end)
+
+  it("has no updates row when everything is up to date", function()
+    local pm = load_pm()
+    with_catalogue(pm)
+    for _i, p in ipairs(pm._manifest.plugins) do p.version = "1.0" end
+    pm:showPluginList()
+    assert.are.equal("logic", menus[#menus].item_table[1]._group)
+  end)
+
+  it("is flat when filtered by name", function()
+    local pm = load_pm()
+    with_catalogue(pm)
+    pm._list_filter = "net"
+    pm:showPluginList()
+    local rows = menus[#menus].item_table
+    assert.is_nil(rows[1].sub_item_table)
+    assert.is_truthy(find(rows, "netwalk"))
+  end)
+
+  it("stays open under a plugin's dialog, and refreshes in the open category", function()
+    local pm = load_pm()
+    with_catalogue(pm)
+    pm:showPluginList()
+    local m = menus[#menus]
+    -- Menu's sub_item_table navigation, as a tap on the row does it.
+    local logic = find(m.item_table, tr("Logic puzzles"))
+    m._group = logic._group
+    m.item_table_stack = { m.item_table }
+    m.item_table = logic.sub_item_table
+    find(m.item_table, "bridges").callback()
+    assert.are.equal(m, pm._list_menu)
+    -- bridges gets updated: the category shows it, and stays open.
+    write(PLUGINS .. "/bridges.koplugin/_meta.lua", 'return { fullname = "bridges", version = "1.1" }\n')
+    pm:refreshHome()
+    assert.are.equal(1, #m.item_table_stack)
+    assert.are.equal("v1.1", find(m.item_table, "bridges").mandatory)
+    -- The updates row now counts one; the overview below follows.
+    assert.are.equal("1", m.item_table_stack[1][1].mandatory)
+  end)
+
+  it("shows a plugin's description in the reader's language", function()
+    local pm = load_pm()
+    with_catalogue(pm)
+    local lang = (G_reader_settings and G_reader_settings:readSetting("language") or "en"):sub(1, 2)
+    local p = pm._manifest.plugins[1]
+    pm:showInstalledDialog(p, pm:scanInstalled().bridges, true)
+    local dlg = H.widgets[#H.widgets]
+    local expected = p.description_i18n[lang] or p.description
+    assert.is_truthy(dlg.title:find(expected, 1, true))
+  end)
+end)
+
+describe("Plugin Manager Update started without its home screen", function()
+  it("hands Wi-Fi back once done (Dashboard's Update plugins)", function()
+    local pm = load_pm()
+    with_catalogue(pm)
+    pm:_runBulkInstall(pm._manifest, {}, { release_wifi = true })
+    H.drain()
+    assert.are.equal(1, net.after)
+  end)
+
+  it("leaves it to the home screen when that is open", function()
+    local pm = load_pm()
+    with_catalogue(pm)
+    pm:_runBulkInstall(pm._manifest, {}, {})
+    H.drain()
+    assert.are.equal(0, net.after)
+  end)
+end)

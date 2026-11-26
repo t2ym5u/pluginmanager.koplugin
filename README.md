@@ -49,7 +49,8 @@ Open **Tools → Plugin Manager**.
 | Load/refresh the plugin catalogue and update everything outdated | Tap **Update** |
 | Install every plugin *and* the repository's patches in one go | **Maintenance… → Install everything…** (see below) |
 | Browse every plugin (installed and available) | Tap **Plugin list** |
-| Install a new plugin | In the plugin list, tap a plugin in the *Available* section → **Install** |
+| Install a new plugin | In the plugin list, open its category and tap it → **Install** |
+| See what can be updated | **Plugin list → Updates available** (shown when there are some) |
 | Update a single plugin | Tap a plugin showing `v1.0 → v1.1` → **Update to v1.1** |
 | Ignore a specific update | In that same dialog → **Ignore vX.Y** (undo from **Ignored updates…**) |
 | Disable/enable a plugin without deleting it | Tap an installed plugin → **Disable**/**Enable** |
@@ -80,7 +81,7 @@ After installing, updating, removing, or (de)disabling a plugin, **restart KORea
 | *Installed (not in repo)* | Plugins installed locally that are not listed in the repository. Tagged `(GitHub)` and offered **Check for update**/**README…**/**Unlink**/**Remove** if a source repo is known (installed via Discover, or manually linked); tagged `(local)` and offered **Link to GitHub repo…**/**Remove** otherwise. |
 | *Available* | Plugins in the repository that are not yet installed. |
 
-The list itself is split into one section per category — *Logic puzzles*, *Sudoku*, *Word games*, *Board games*, *Card & dice games*, *Classic puzzles*, *Party & quiz*, *Utilities* — each opened by a header row with its plugin count. Plugins without a category (locally-installed or GitHub plugins, or anything the repository has not categorised yet) go under *Other*. The name/status sort applies inside each section, and the search box narrows the whole list as before; **Category: …** in the same search dialog shows a single category. With a plugin list from before categories existed, the list stays flat.
+The list opens on its categories — *Logic puzzles*, *Sudoku*, *Word games*, *Board games*, *Card & dice games*, *Classic puzzles*, *Party & quiz*, *Two readers*, *Utilities* — one row each with its plugin count and how many have an update, and an **Updates available** row first when there are some. Tap a row to see its plugins; the close button brings you back to the categories. A plugin's dialog opens over the list, which stays where it was and shows the result of an install, update or removal. Plugins without a category (locally-installed or GitHub plugins, or anything the repository has not categorised yet) go under *Other*. The name/status sort applies inside each category; the search box gives a flat list of the matching plugins, split by category; **Category: …** in the same search dialog shows a single category. With a plugin list from before categories existed, the list stays flat. Descriptions are shown in the reader's language when the plugin provides a translation.
 
 A plugin whose new version needs a newer KOReader than yours shows `(vX needs KOReader YYYY.MM)` instead of an update arrow, and an available one `(needs KOReader YYYY.MM)`.
 
